@@ -3,4 +3,16 @@ name = "mpdsr"
 version = "0.1.0"
 edition = "2024"
 
+[[bin]]
+name = "server"
+path = "src/server.rs"
+
+[[bin]]
+name = "client"
+path = "src/client.rs"
+
+
 [dependencies]
+aya = { version = "0.13.1", default-features = false }
+eyre = "0.6.12"
+
