@@ -20,8 +20,8 @@ struct __attribute__((__packed__)) tcp_extension_hdr
 {
     __u8 kind; /* 254 */
     __u8 len; /* 8   */
+    __u16 magic; /* 1417 */
     __u32 connection_id;
-    __u16 pad;
 };
 
 struct __attribute__((__packed__)) ipv4_key
@@ -66,8 +66,8 @@ static __always_inline int get_server_id(__be16 port)
     return -1;
 }
 
-SEC("sockops")
-int bpf_sockops_handler(struct bpf_sock_ops* skops)
+SEC("sockops_encoder")
+int bpf_sockops_encoder(struct bpf_sock_ops* skops)
 {
     int server_id = get_server_id(skops->local_port);
     if (server_id == -1)
@@ -107,13 +107,15 @@ int bpf_sockops_handler(struct bpf_sock_ops* skops)
             struct tcp_extension_hdr opt = {
                 .kind = 254,
                 .len = 8,
+                .magic = bpf_htons(1417),
                 .connection_id = bpf_htonl(ext->connection_id),
-                .pad = 0,
             };
             if (bpf_store_hdr_opt(skops, &opt, sizeof(opt), 0) != 0)
             {
                 bpf_print("bpf_store_hdr_opt failed");
+                break;
             }
+            bpf_printk("encoded");
             break;
         }
     }
