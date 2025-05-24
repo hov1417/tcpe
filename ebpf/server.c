@@ -6,8 +6,9 @@
         bpf_trace_printk(_fmt, sizeof(_fmt), ##__VA_ARGS__);                  \
     } while (0)
 
+#ifndef DEBUG_CODE
 #define bpf_print(fmt, ...)
-
+#endif
 
 static __always_inline int get_server_id(__be16 port)
 {
@@ -29,6 +30,10 @@ static __always_inline int get_server_id(__be16 port)
 SEC("sockops_server")
 int bpf_sockops_server(struct bpf_sock_ops* skops)
 {
+    if (skops->family != AF_INET)
+    {
+        return 1;
+    }
     int server_id = get_server_id(skops->local_port);
     if (server_id == -1)
     {
@@ -72,10 +77,6 @@ int bpf_sockops_server(struct bpf_sock_ops* skops)
         break;
     case BPF_SOCK_OPS_WRITE_HDR_OPT_CB:
         {
-            if (skops->family != AF_INET)
-            {
-                break;
-            }
             // __u64 pidtig = bpf_get_current_pid_tgid();
             // bpf_print("%llu", pidtig);
             // __u32* connection_id = bpf_map_lookup_elem(&pid_to_connid, &pidtig);

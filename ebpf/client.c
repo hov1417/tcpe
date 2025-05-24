@@ -7,6 +7,10 @@
         bpf_trace_printk(_fmt, sizeof(_fmt), ##__VA_ARGS__);                  \
     } while (0)
 
+#ifndef DEBUG_CODE
+#define bpf_print(fmt, ...)
+#endif
+
 static __always_inline int get_server_id(__be16 port)
 {
     const __u16 ports[] = {TRACE_PORTS};
@@ -53,7 +57,7 @@ int bpf_sockops_client(struct bpf_sock_ops* skops)
     if (ret < 0)
     {
         bpf_printk("bpf_load_hdr_opt %d", ret);
-        return 0;
+        // return 0;
     }
 
     switch (skops->op)

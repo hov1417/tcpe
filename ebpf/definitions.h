@@ -23,7 +23,7 @@
 #include <bpf/bpf_endian.h>
 #include <bpf/bpf_helpers.h>
 
-#define TCPE_KIND 256
+#define TCPE_KIND 254
 #define TCPE_MAGIC bpf_htons(1417)
 
 
