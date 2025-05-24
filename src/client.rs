@@ -1,27 +1,24 @@
-use aya::maps::{Map, MapData};
+use mpdsr::{get_connection_id, SERVER_IP};
 use std::io::{Read, Write};
-use std::net::{Shutdown, TcpStream};
-use eyre::Context;
+use std::net::{Shutdown, SocketAddr, TcpStream};
 
 fn main() -> eyre::Result<()> {
-    // let map_data = MapData::from_pin("/sys/fs/bpf/tc/globals/availability")
-    //     .context("Availability map not found")?;
-    // let availability_map = aya::maps::Array::<MapData, u32>::try_from(Map::Array(map_data))?;
-    // let server = availability_map
-    //     .iter()
-    //     .take(service)
-    //     .filter_map(flatten)
-    //     .enumerate()
-    //     .min_by_key(|(_, v)| *v)
-    //     .map(|(i, _)| i)
-    //     .unwrap_or(0);
-    let mut stream = TcpStream::connect(("192.168.2.79", 8080))?;
+    let remote_sock: SocketAddr = (SERVER_IP, 8080).into();
+    let mut stream = TcpStream::connect(remote_sock)?;
     stream.write_all(b"Request")?;
-    stream.flush()?;
+
+    let connection_id = get_connection_id(stream.local_addr()?, remote_sock);
+    println!("{connection_id:?}");
+
     stream.shutdown(Shutdown::Write)?;
+
     let mut buf = Vec::new();
     stream.read_to_end(&mut buf)?;
+
+    let connection_id = get_connection_id(stream.local_addr()?, remote_sock);
+    println!("{connection_id:?}");
+
     println!("{}", String::from_utf8_lossy(&buf));
-    
+
     Ok(())
 }
