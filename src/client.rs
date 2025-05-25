@@ -1,15 +1,48 @@
+use aya::maps::{Map, MapData, MapError};
 use eyre::{bail, Context};
-use mpdsr::{get_connection_id, SERVER_IP};
+use mpdsr::{get_connection_id, get_key, SERVER_IP};
 use nix::poll::{poll, PollFd, PollFlags, PollTimeout};
 use std::io;
 use std::io::Read;
 use std::io::{ErrorKind, Write};
-use std::net::{Shutdown, SocketAddr, TcpStream};
+use std::net::{Ipv4Addr, Shutdown, SocketAddr, SocketAddrV4, TcpStream};
 use std::os::fd::AsFd;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
+
+pub fn get_new_path(
+    local_sock: SocketAddr,
+    remote_sock: SocketAddr,
+) -> eyre::Result<Option<SocketAddr>> {
+    let map_data = MapData::from_pin("/sys/fs/bpf/tc/globals/tcpe_path_map")
+        .context("tcpe_path_map map not found")?;
+    let mut availability_map =
+        aya::maps::HashMap::<MapData, [u8; 12], [u8; 6]>::try_from(Map::HashMap(map_data))?;
+    let key = get_key(
+        local_sock.ip(),
+        local_sock.port(),
+        remote_sock.ip(),
+        remote_sock.port(),
+    );
+    let data = availability_map
+        .get(&key, 0)
+        .map(Some)
+        .or_else(|e| match e {
+            MapError::KeyNotFound => Ok(None),
+            e => Err(e),
+        })?;
+    if let Some(data) = data {
+        let address = Ipv4Addr::from_bits(u32::from_be_bytes((&data[0..4]).try_into().unwrap()));
+        let port = u16::from_be_bytes((&data[4..6]).try_into().unwrap());
+        availability_map.remove(&key)?;
+        Ok(Some(SocketAddr::V4(SocketAddrV4::new(address, port))))
+    } else {
+        Ok(None)
+    }
+}
 
 // TODO: error handling
-fn read_first(streams: &mut [TcpStream], buf: &mut [u8]) -> io::Result<usize> {
+fn read_first(client: &mut MutexGuard<TCPEReaderInner>, buf: &mut [u8]) -> io::Result<usize> {
+    let streams = &mut client.streams;
     let mut poll_fds: Vec<PollFd> = streams
         .iter()
         .map(|s| PollFd::new(s.as_fd(), PollFlags::POLLIN))
@@ -25,6 +58,9 @@ fn read_first(streams: &mut [TcpStream], buf: &mut [u8]) -> io::Result<usize> {
             .contains(PollFlags::POLLIN)
         {
             let n = streams[i].read(buf)?;
+            let tcpe_path = get_new_path(streams[i].local_addr()?, streams[i].peer_addr()?)
+                .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+            client.local_paths.extend(tcpe_path.into_iter());
             return Ok(n);
         }
     }
@@ -34,6 +70,8 @@ fn read_first(streams: &mut [TcpStream], buf: &mut [u8]) -> io::Result<usize> {
 struct TCPEReaderInner {
     connection_id: u32,
     streams: Vec<TcpStream>,
+    remote_paths: Vec<SocketAddr>,
+    local_paths: Vec<SocketAddr>,
 }
 
 #[derive(Clone)]
@@ -54,6 +92,8 @@ impl TCPEClient {
         Ok(TCPEClient {
             inner: Arc::new(Mutex::new(TCPEReaderInner {
                 connection_id,
+                local_paths: vec![initial_stream.local_addr()?],
+                remote_paths: vec![remote_sock],
                 streams: vec![initial_stream],
             })),
         })
@@ -106,7 +146,7 @@ impl Write for TCPEClient {
 impl Read for TCPEClient {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         let mut client = self.inner.lock().map_err(|_| ErrorKind::BrokenPipe)?;
-        read_first(&mut client.streams, buf)
+        read_first(&mut client, buf)
     }
 }
 

@@ -41,7 +41,7 @@ int bpf_sockops_client(struct bpf_sock_ops* skops)
         skops,
         BPF_SOCK_OPS_PARSE_ALL_HDR_OPT_CB_FLAG | BPF_SOCK_OPS_PARSE_UNKNOWN_HDR_OPT_CB_FLAG
     );
-    struct tcp_extension_hdr hdr = {
+    struct tcpe_initial hdr = {
         .kind = 254,
         .len = 4, // search query size, not header size
         .magic = bpf_htons(1417),
@@ -64,7 +64,7 @@ int bpf_sockops_client(struct bpf_sock_ops* skops)
     {
     case BPF_SOCK_OPS_PARSE_HDR_OPT_CB:
         {
-            struct tcp_extension_hdr hdr = {
+            struct tcpe_initial hdr = {
                 .kind = 254,
                 .len = 4, // search query size, not header size
                 .magic = bpf_htons(1417),

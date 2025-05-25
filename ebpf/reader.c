@@ -25,6 +25,15 @@ struct
     __uint(max_entries, 4096);
 } tcpe_conn_map SEC(".maps");
 
+struct
+{
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __type(key, struct ipv4_key);
+    __type(value, struct tcpe_path);
+    __uint(pinning, LIBBPF_PIN_BY_NAME);
+    __uint(max_entries, 4096);
+} tcpe_path_map SEC(".maps");
+
 
 #ifdef DEBUG_CODE
 #define bpf_print(fmt, ...)                                                   \
@@ -52,7 +61,38 @@ static __always_inline int get_server_id(__be16 port)
     return -1;
 }
 
-void __always_inline traverse_tcp_options(int opt_len, __u8 opts[40], __u32* connection_id_ret)
+struct ipv4_key get_client_key(struct iphdr* iph, struct tcphdr* tcp)
+{
+    // client side keys are in reverse order
+    return {
+        .daddr = iph->saddr,
+        .saddr = iph->daddr,
+        .dport = tcp->source,
+        .sport = tcp->dest,
+    };
+}
+
+void handle_initiation(struct iphdr* iph, struct tcphdr* tcp, __u32 connection_id)
+{
+    // client side keys are in reverse order
+    const struct ipv4_key key = get_client_key(iph, tcp);
+    const struct tcpe value = {
+        .connection_id = connection_id
+    };
+    bpf_map_update_elem(&tcpe_conn_map, &key, &value, BPF_ANY);
+}
+
+void handle_new_path(struct iphdr* iph, struct tcphdr* tcp, __u32 address, __u16 port)
+{
+    const struct ipv4_key key = get_client_key(iph, tcp);
+    const struct tcpe_path value = {
+        .address = address,
+        .port = port
+    };
+    bpf_map_update_elem(&tcpe_path_map, &key, &value, BPF_ANY);
+}
+
+void __always_inline traverse_tcp_options(struct iphdr* iph, struct tcphdr* tcp, int opt_len, __u8 opts[40])
 {
     __u32 next_kind = 0;
     for (int i = 0; i < opt_len; i++)
@@ -78,22 +118,41 @@ void __always_inline traverse_tcp_options(int opt_len, __u8 opts[40], __u32* con
             break;
         if (kind == TCPE_KIND)
         {
-            /* option must be at least 8 bytes: kind, len, magic(2), id(4) */
-            if (i + 8 > opt_len)
+            /* option must be at least 4 bytes: kind, len, magic(2) */
+            if (i + 4 > opt_len)
+            {
+                bpf_print("short TCPE option");
+                return;
+            }
+
+            __u16 magic = (opts[(i + 3)] << 8) | opts[i + 2];
+            if (
+                (magic == TCPE_INITIAL && sizeof(struct tcpe_initial) > opt_len) ||
+                (magic == TCPE_NEW_PATH && sizeof(struct tcpe_new_path) > opt_len)
+            )
             {
                 bpf_print("error loading TCPE option");
                 return;
             }
 
-            __u16 magic = (opts[(i + 3)] << 8) | opts[i + 2];
-            if (magic == TCPE_MAGIC)
+            if (magic == TCPE_INITIAL)
             {
                 __u32 connection_id = (opts[(i + 7)] << 24)
                     | (opts[(i + 6)] << 16)
                     | (opts[i + 5] << 8)
                     | opts[i + 4];
-                *connection_id_ret = bpf_ntohl(connection_id);
+                handle_initiation(iph, tcp, bpf_ntohl(connection_id));
                 bpf_print("connection id %u", *connection_id_ret);
+                return;
+            }
+            if (magic == TCPE_NEW_PATH)
+            {
+                __u32 address = (opts[(i + 7)] << 24)
+                    | (opts[(i + 6)] << 16)
+                    | (opts[i + 5] << 8)
+                    | opts[i + 4];
+                __u32 port = (opts[i + 9] << 8) | opts[i + 8];
+                handle_new_path(iph, tcp, bpf_ntohl(address), bpf_ntohs(port));
                 return;
             }
         }
@@ -151,22 +210,7 @@ int reader_ingress_func(struct __sk_buff* skb)
         return TC_ACT_OK;
     }
 
-    __u32 connection_id = 0;
-    traverse_tcp_options(opt_len, opts, &connection_id);
-    if (connection_id != 0)
-    {
-        // client side keys are in reverse order
-        const struct ipv4_key key = {
-            .daddr = iph->saddr,
-            .saddr = iph->daddr,
-            .dport = tcp->source,
-            .sport = tcp->dest,
-        };
-        const struct tcpe value = {
-            .connection_id = connection_id
-        };
-        bpf_map_update_elem(&tcpe_conn_map, &key, &value, BPF_ANY);
-    }
+    traverse_tcp_options(iph, tcp, opt_len, opts);
 
     return TC_ACT_OK;
 }

@@ -51,8 +51,8 @@ int bpf_sockops_server(struct bpf_sock_ops* skops)
     {
     case BPF_SOCK_OPS_HDR_OPT_LEN_CB:
         bpf_sock_ops_cb_flags_set(skops, BPF_SOCK_OPS_WRITE_HDR_OPT_CB_FLAG);
-        skops->reply = sizeof(struct tcp_extension_hdr);
-        const long res = bpf_reserve_hdr_opt(skops, sizeof(struct tcp_extension_hdr), 0);
+        skops->reply = sizeof(struct tcpe_initial);
+        const long res = bpf_reserve_hdr_opt(skops, sizeof(struct tcpe_initial), 0);
         if (res != 0)
         {
             bpf_print("bpf_reserve_hdr_opt %d", res);
@@ -73,10 +73,10 @@ int bpf_sockops_server(struct bpf_sock_ops* skops)
                 __u64 connection_id = bpf_get_prandom_u32();
                 bpf_printk("connection_id = %llu", connection_id);
 
-                struct tcp_extension_hdr opt = {
+                struct tcpe_initial opt = {
                     .kind = TCPE_KIND,
                     .len = 8,
-                    .magic = TCPE_MAGIC,
+                    .magic = TCPE_INITIAL,
                     .connection_id = bpf_htonl(connection_id),
                 };
 

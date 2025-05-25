@@ -24,20 +24,36 @@
 #include <bpf/bpf_helpers.h>
 
 #define TCPE_KIND 254
-#define TCPE_MAGIC bpf_htons(1417)
-
+#define TCPE_INITIAL bpf_htons(1417)
+#define TCPE_NEW_PATH bpf_htons(1418)
 
 struct tcpe
 {
     __u32 connection_id;
 };
 
-struct __attribute__((__packed__)) tcp_extension_hdr
+struct tcpe_path
+{
+    __u32 address;
+    __u16 port;
+};
+
+struct __attribute__((__packed__)) tcpe_initial
 {
     __u8 kind; /* 254 */
     __u8 len; /* 8   */
     __u16 magic; /* 1417 */
     __u32 connection_id;
+};
+
+struct __attribute__((__packed__)) tcpe_new_path
+{
+    __u8 kind; /* 254 */
+    __u8 len; /* 8 */
+    __u16 magic; /* 1418 */
+    __u32 address;
+    __u16 port;
+    __u16 padd;
 };
 
 struct __attribute__((__packed__)) ipv4_key
@@ -66,23 +82,6 @@ struct
     __uint(max_entries, 4096);
 } tcpe_egress_map SEC(".maps");
 
-
-// struct __attribute__((__packed__)) ipv4_key_3
-// {
-//     __u32 daddr;
-//     __u32 saddr;
-//     __u16 dport;
-// };
-
-// struct
-// {
-//     __uint(type, BPF_MAP_TYPE_HASH);
-//     __type(key, struct ipv4_key_3);
-//     __type(value, struct tcpe);
-//     __uint(pinning, LIBBPF_PIN_BY_NAME);
-//     __uint(max_entries, 4096);
-// } tcpe_egress_map_3 SEC(".maps");
-
 struct
 {
     __uint(type, BPF_MAP_TYPE_HASH);
@@ -92,7 +91,7 @@ struct
     __uint(max_entries, 4096);
 } pid_to_connid SEC(".maps");
 
-char* op_name(int op)
+inline char* op_name(int op)
 {
     switch (op)
     {
@@ -128,6 +127,7 @@ char* op_name(int op)
         return "BPF_SOCK_OPS_HDR_OPT_LEN_CB";
     case BPF_SOCK_OPS_WRITE_HDR_OPT_CB:
         return "BPF_SOCK_OPS_WRITE_HDR_OPT_CB";
+    default:
+        return "UNKNOWN";
     }
-    return "";
 }
