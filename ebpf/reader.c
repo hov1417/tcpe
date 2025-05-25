@@ -45,7 +45,7 @@ struct
 #define bpf_print(fmt, ...)
 #endif
 
-static __always_inline int get_server_id(__be16 port)
+static __always_inline int get_app_id(__be16 port)
 {
     const __u16 ports[] = {TRACE_PORTS};
 
@@ -61,15 +61,17 @@ static __always_inline int get_server_id(__be16 port)
     return -1;
 }
 
-struct ipv4_key get_client_key(struct iphdr* iph, struct tcphdr* tcp)
+// TODO for server
+struct ipv4_key __always_inline get_client_key(const struct iphdr* iph, const struct tcphdr* tcp)
 {
     // client side keys are in reverse order
-    return {
+    const struct ipv4_key result = {
         .daddr = iph->saddr,
         .saddr = iph->daddr,
         .dport = tcp->source,
         .sport = tcp->dest,
     };
+    return result;
 }
 
 void handle_initiation(struct iphdr* iph, struct tcphdr* tcp, __u32 connection_id)
@@ -141,8 +143,8 @@ void __always_inline traverse_tcp_options(struct iphdr* iph, struct tcphdr* tcp,
                     | (opts[(i + 6)] << 16)
                     | (opts[i + 5] << 8)
                     | opts[i + 4];
+                bpf_print("connection id %u", connection_id);
                 handle_initiation(iph, tcp, bpf_ntohl(connection_id));
-                bpf_print("connection id %u", *connection_id_ret);
                 return;
             }
             if (magic == TCPE_NEW_PATH)
@@ -185,7 +187,7 @@ int reader_ingress_func(struct __sk_buff* skb)
     {
         return TC_ACT_OK;
     }
-    const int server_id = get_server_id(tcp->source);
+    const int server_id = get_app_id(tcp->source);
     if (server_id < 0)
     {
         return TC_ACT_OK;
