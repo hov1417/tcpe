@@ -1,30 +1,15 @@
-use aya::maps::{Map, MapData};
-use eyre::Context;
 use mpdsr::{SERVER_IP, SERVER_PORT};
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
-use aya::maps::MapType::SockMap;
 
 fn main() -> eyre::Result<()> {
     let listen = TcpListener::bind((SERVER_IP, SERVER_PORT))?;
     loop {
-        // let pid_tgid = get_pid_tgid();
-        // println!("{pid_tgid}");
-        // set_connection_id(pid_tgid)?;
         let (stream, sock) = listen.accept()?;
         if let Err(e) = handle(stream, sock) {
             println!("Error: {}", e);
         }
     }
-}
-
-fn get_pid_tgid() -> u64 {
-    let tid = unsafe { libc::gettid() as u64 };
-    let tgid = unsafe { libc::getpid() as u64 };
-    println!("{tid}");
-    println!("{tgid}");
-    let pid_tgid = (tid << 32) | tgid;
-    pid_tgid
 }
 
 fn handle(mut stream: TcpStream, remote_sock: SocketAddr) -> eyre::Result<()> {

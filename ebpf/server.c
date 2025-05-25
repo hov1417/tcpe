@@ -1,12 +1,12 @@
 #include "definitions.h"
 
+#ifdef DEBUG_CODE
 #define bpf_print(fmt, ...)                                                   \
     do {                                                                      \
         static const char _fmt[] = "server - " fmt;                            \
         bpf_trace_printk(_fmt, sizeof(_fmt), ##__VA_ARGS__);                  \
-    } while (0)
-
-#ifndef DEBUG_CODE
+} while (0)
+#else
 #define bpf_print(fmt, ...)
 #endif
 
@@ -39,35 +39,18 @@ int bpf_sockops_server(struct bpf_sock_ops* skops)
     {
         return 1;
     }
-    // if (3 <= skops->op && skops->op <= 5)
     bpf_print("skops->op %s", op_name(skops->op));
-    bpf_sock_ops_cb_flags_set(skops, BPF_SOCK_OPS_WRITE_HDR_OPT_CB_FLAG);
 
-    bpf_print("daddr = %u", bpf_ntohl(skops->remote_ip4));
-    bpf_print("saddr = %u", bpf_ntohl(skops->local_ip4));
-    bpf_print("dport = %u", bpf_ntohs(bpf_htons(bpf_htonl(skops->remote_port))));
-    bpf_print("sport = %u", bpf_ntohs(bpf_htons(skops->local_port)));
-    __u64 pidtig = bpf_get_current_pid_tgid();
-    bpf_print("pidtig = %llu", pidtig);
-    bpf_print("syn = %llu", skops->skb_tcp_flags & TCPHDR_SYN);
+    // bpf_print("daddr = %u", bpf_ntohl(skops->remote_ip4));
+    // bpf_print("saddr = %u", bpf_ntohl(skops->local_ip4));
+    // bpf_print("dport = %u", bpf_ntohs(bpf_htons(bpf_htonl(skops->remote_port))));
+    // bpf_print("sport = %u", bpf_ntohs(bpf_htons(skops->local_port)));
+
 
     switch (skops->op)
     {
-    case BPF_SOCK_OPS_RWND_INIT:
-        {
-            // const struct ipv4_key key = {
-            //     .daddr = skops->remote_ip4,
-            //     .saddr = skops->local_ip4,
-            //     .dport = bpf_htons(bpf_htonl(skops->remote_port)),
-            //     .sport = bpf_htons(skops->local_port),
-            // };
-            // struct tcp_extension tcp_extension = {
-            //     .connection_id = bpf_get_prandom_u32()
-            // };
-            // bpf_map_update_elem(&tcp_extension_egress_map, &key, &tcp_extension, BPF_ANY);
-            break;
-        }
     case BPF_SOCK_OPS_HDR_OPT_LEN_CB:
+        bpf_sock_ops_cb_flags_set(skops, BPF_SOCK_OPS_WRITE_HDR_OPT_CB_FLAG);
         skops->reply = sizeof(struct tcp_extension_hdr);
         const long res = bpf_reserve_hdr_opt(skops, sizeof(struct tcp_extension_hdr), 0);
         if (res != 0)
@@ -88,6 +71,7 @@ int bpf_sockops_server(struct bpf_sock_ops* skops)
             if (skops->skb_tcp_flags & TCPHDR_SYN)
             {
                 __u64 connection_id = bpf_get_prandom_u32();
+                bpf_printk("connection_id = %llu", connection_id);
 
                 struct tcp_extension_hdr opt = {
                     .kind = TCPE_KIND,

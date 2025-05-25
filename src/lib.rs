@@ -44,10 +44,8 @@ pub fn get_connection_id(
     local_sock: SocketAddr,
     remote_sock: SocketAddr,
 ) -> eyre::Result<Option<u32>> {
-    println!("local_sock {local_sock:?}");
-    println!("remote_sock {remote_sock:?}");
-    let map_data = MapData::from_pin("/sys/fs/bpf/tcp_extension_ingress_map")
-        .context("tcp_extension_ingress_map map not found")?;
+    let map_data = MapData::from_pin("/sys/fs/bpf/tc/globals/tcpe_conn_map")
+        .context("tcpe_conn_map map not found")?;
     let availability_map =
         aya::maps::HashMap::<MapData, [u8; 12], u32>::try_from(Map::HashMap(map_data))?;
     let connection_id = availability_map
