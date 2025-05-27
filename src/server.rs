@@ -1,36 +1,25 @@
-use mpdsr::{SERVER_IP, SERVER_PORT};
-use std::io::{Read, Write};
-use std::net::{SocketAddr, TcpListener, TcpStream};
+use mpdsr::{TcpeServer, TcpeStream, SERVER_IP, SERVER_PORT};
+use std::io::Read;
 
 fn main() -> eyre::Result<()> {
-    let listen = TcpListener::bind((SERVER_IP, SERVER_PORT))?;
+    let listen = TcpeServer::bind((SERVER_IP, SERVER_PORT).into())?;
     loop {
-        let (stream, sock) = listen.accept()?;
-        if let Err(e) = handle(stream, sock) {
+        let stream = listen.accept()?;
+        if let Err(e) = handle(stream) {
             println!("Error: {}", e);
         }
     }
 }
 
-fn handle(mut stream: TcpStream, remote_sock: SocketAddr) -> eyre::Result<()> {
-    let local_sock = stream.local_addr()?;
+fn handle(mut stream: TcpeStream) -> eyre::Result<()> {
+    // let local_sock = stream.local_addr()?;
     // set_connection_id(local_sock, remote_sock)?;
 
     let mut buf = Vec::new();
     stream.read_to_end(&mut buf)?;
     println!("{}", String::from_utf8_lossy(&buf));
 
-    stream.write_all(b"hello world")?;
+    // stream.write_all(b"hello world")?;
 
     Ok(())
 }
-// 
-// pub fn set_connection_id(pid_tgid: u64) -> eyre::Result<()> {
-//     let map_data =
-//         MapData::from_pin("/sys/fs/bpf/pid_to_connid").context("pid_to_connid map not found")?;
-//     let mut map = aya::maps::HashMap::<MapData, u64, u32>::try_from(Map::HashMap(map_data))?;
-//     let connection_id: u32 = 5423;
-//     map.insert(pid_tgid, connection_id, 0)?;
-// 
-//     Ok(())
-// }

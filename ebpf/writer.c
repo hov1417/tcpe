@@ -1,15 +1,20 @@
+/**
+ * Writer sockops ebpf program on egress
+ * writes requested info on TCPE packets
+ */
+
 #include "definitions.h"
 
-
 #ifdef IS_SERVER
-#define prefix "server - "
+#define PREFIX "server - "
 #else
-#define prefix "client - "
+#define PREFIX "client - "
 #endif
+
 #ifdef DEBUG_CODE
 #define bpf_print(fmt, ...)                                                   \
     do {                                                                      \
-        static const char _fmt[] = prefix fmt;                                \
+        static const char _fmt[] = PREFIX fmt;                                \
         bpf_trace_printk(_fmt, sizeof(_fmt), ##__VA_ARGS__);                  \
     } while (0)
 #else
@@ -38,9 +43,49 @@ struct
     __uint(type, BPF_MAP_TYPE_HASH);
     __type(key, struct ipv4_key);
     __type(value, struct tcpe_path);
-    __uint(pinning, LIBBPF_PIN_BY_NAME);
     __uint(max_entries, 4096);
 } tcpe_new_path_map SEC(".maps");
+
+struct
+{
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __type(key, struct ipv4_key);
+    __type(value, struct tcpe);
+    __uint(max_entries, 4096);
+} tcpe_conn_map SEC(".maps");
+
+
+struct ipv4_key __always_inline get_key_client(struct bpf_sock_ops* skops)
+{
+    const struct ipv4_key key = {
+        .server_addr = skops->remote_ip4,
+        .client_addr = skops->local_ip4,
+        .server_port = skops->remote_port >> 16,
+        .client_port = (bpf_htonl(skops->local_port)) >> 16,
+    };
+    return key;
+}
+
+struct ipv4_key __always_inline get_key_server(struct bpf_sock_ops* skops)
+{
+    const struct ipv4_key key = {
+        .server_addr = skops->local_ip4,
+        .client_addr = skops->remote_ip4,
+        .server_port = (bpf_htonl(skops->local_port)) >> 16,
+        .client_port = skops->remote_port >> 16,
+    };
+    return key;
+}
+
+
+struct ipv4_key __always_inline get_key(struct bpf_sock_ops* skops)
+{
+#ifdef IS_SERVER
+    return get_key_server(skops);
+#else
+    return get_key_client(skops);
+#endif
+}
 
 SEC("sockops")
 int bpf_sockops(struct bpf_sock_ops* skops)
@@ -57,12 +102,10 @@ int bpf_sockops(struct bpf_sock_ops* skops)
         return 1;
     }
     bpf_print("skops->op %s", op_name(skops->op));
-    bpf_print("syn %u", skops->skb_tcp_flags & TCPHDR_SYN);
-    long ret = 0;
-    ret = bpf_sock_ops_cb_flags_set(skops, skops->bpf_sock_ops_cb_flags | BPF_SOCK_OPS_WRITE_HDR_OPT_CB_FLAG);
+    long ret = bpf_sock_ops_cb_flags_set(skops, BPF_SOCK_OPS_WRITE_HDR_OPT_CB_FLAG);
     if (ret != 0)
     {
-        bpf_print("bpf_sock_ops_cb_flags_set %u", bpf_sock_ops_cb_flags_set);
+        bpf_print("bpf_sock_ops_cb_flags_set %u", ret);
     }
 
     int size = -1;
@@ -81,12 +124,7 @@ int bpf_sockops(struct bpf_sock_ops* skops)
         }
         else
         {
-            const struct ipv4_key key = {
-                .daddr = skops->remote_ip4,
-                .saddr = skops->local_ip4,
-                .dport = bpf_htons(bpf_htonl(skops->remote_port)),
-                .sport = bpf_htons(skops->local_port),
-            };
+            const struct ipv4_key key = get_key(skops);
             const struct tcpe_path* new_path = bpf_map_lookup_elem(&tcpe_new_path_map, &key);
             if (new_path != NULL)
             {
@@ -108,9 +146,21 @@ int bpf_sockops(struct bpf_sock_ops* skops)
         break;
     case BPF_SOCK_OPS_WRITE_HDR_OPT_CB:
         {
+            const struct ipv4_key key = get_key(skops);
             if (skops->skb_tcp_flags & TCPHDR_SYN)
             {
-                __u32 connection_id = bpf_get_prandom_u32();
+                __u32 connection_id;
+                __u32* existing_connection = bpf_map_lookup_elem(&tcpe_conn_map, &key);
+                if (existing_connection != NULL)
+                {
+                    bpf_print("existing_connection");
+                    connection_id = *existing_connection;
+                }
+                else
+                {
+                    bpf_print("not existing_connection");
+                    connection_id = bpf_get_prandom_u32();
+                }
                 bpf_print("connection_id = %u", connection_id);
 
                 const struct tcpe_initial opt = {
@@ -125,16 +175,10 @@ int bpf_sockops(struct bpf_sock_ops* skops)
                     bpf_print("bpf_store_hdr_opt failed");
                     break;
                 }
-                bpf_print("writing connection hdr");
+                // bpf_print("writing connection hdr");
             }
             else
             {
-                const struct ipv4_key key = {
-                    .daddr = skops->remote_ip4,
-                    .saddr = skops->local_ip4,
-                    .dport = bpf_htons(bpf_htonl(skops->remote_port)),
-                    .sport = bpf_htons(skops->local_port),
-                };
                 struct tcpe_path* new_path = bpf_map_lookup_elem(&tcpe_new_path_map, &key);
                 if (new_path != NULL)
                 {
@@ -147,7 +191,7 @@ int bpf_sockops(struct bpf_sock_ops* skops)
                         .padd = 0,
                     };
 
-                    bpf_print("writing path hdr");
+                    // bpf_print("writing path hdr");
                     if (bpf_store_hdr_opt(skops, &opt, sizeof(opt), 0) != 0)
                     {
                         bpf_print("bpf_store_hdr_opt failed");

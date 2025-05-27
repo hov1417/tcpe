@@ -1,20 +1,25 @@
-#include "definitions.h"
-#include <linux/bpf.h>
-#include <linux/filter.h>
-#include <linux/if_ether.h>
-#include <linux/if_packet.h>
-#include <linux/if_vlan.h>
-#include <linux/in.h>
-#include <linux/ip.h>
-#include <linux/pkt_cls.h>
-#include <linux/tcp.h>
-#include <linux/udp.h>
-#include <stddef.h>
+/**
+ * Reader tc ebpf program on ingress
+ * reads and stores all info related to TCPE
+ */
 
-#include <bpf/bpf_endian.h>
-#include <bpf/bpf_helpers.h>
-#include <bpf/bpf_tracing.h>
-#include <bpf/bpf_core_read.h>
+#include "definitions.h"
+
+#ifdef IS_SERVER
+#define PREFIX "reader server - "
+#else
+#define PREFIX "reader client - "
+#endif
+
+#ifdef DEBUG_CODE
+#define bpf_print(fmt, ...)                                                   \
+    do {                                                                      \
+        static const char _fmt[] = PREFIX fmt;                                       \
+        bpf_trace_printk(_fmt, sizeof(_fmt), ##__VA_ARGS__);                  \
+    } while (0)
+#else
+#define bpf_print(fmt, ...)
+#endif
 
 struct
 {
@@ -35,16 +40,6 @@ struct
 } tcpe_path_map SEC(".maps");
 
 
-#ifdef DEBUG_CODE
-#define bpf_print(fmt, ...)                                                   \
-    do {                                                                      \
-        static const char _fmt[] = "reader - " fmt;                                       \
-        bpf_trace_printk(_fmt, sizeof(_fmt), ##__VA_ARGS__);                  \
-    } while (0)
-#else
-#define bpf_print(fmt, ...)
-#endif
-
 static __always_inline int get_app_id(__be16 port)
 {
     const __u16 ports[] = {TRACE_PORTS};
@@ -61,32 +56,49 @@ static __always_inline int get_app_id(__be16 port)
     return -1;
 }
 
-// TODO for server
-struct ipv4_key __always_inline get_client_key(const struct iphdr* iph, const struct tcphdr* tcp)
+struct ipv4_key __always_inline get_key_client(const struct iphdr* iph, const struct tcphdr* tcp)
 {
-    // client side keys are in reverse order
-    const struct ipv4_key result = {
-        .daddr = iph->saddr,
-        .saddr = iph->daddr,
-        .dport = tcp->source,
-        .sport = tcp->dest,
+    const struct ipv4_key key = {
+        .server_addr = iph->saddr,
+        .client_addr = iph->daddr,
+        .server_port = tcp->source,
+        .client_port = tcp->dest,
     };
-    return result;
+    return key;
 }
 
-void handle_initiation(struct iphdr* iph, struct tcphdr* tcp, __u32 connection_id)
+struct ipv4_key __always_inline get_key_server(const struct iphdr* iph, const struct tcphdr* tcp)
 {
-    // client side keys are in reverse order
-    const struct ipv4_key key = get_client_key(iph, tcp);
+    const struct ipv4_key key = {
+        .server_addr = iph->daddr,
+        .client_addr = iph->saddr,
+        .server_port = tcp->dest,
+        .client_port = tcp->source,
+    };
+    return key;
+}
+
+struct ipv4_key __always_inline get_key(const struct iphdr* iph, const struct tcphdr* tcp)
+{
+#ifdef IS_SERVER
+    return get_key_server(iph, tcp);
+#else
+    return get_key_client(iph, tcp);
+#endif
+}
+
+void __always_inline handle_initiation(struct iphdr* iph, struct tcphdr* tcp, __u32 connection_id)
+{
+    const struct ipv4_key key = get_key(iph, tcp);
     const struct tcpe value = {
         .connection_id = connection_id
     };
     bpf_map_update_elem(&tcpe_conn_map, &key, &value, BPF_ANY);
 }
 
-void handle_new_path(struct iphdr* iph, struct tcphdr* tcp, __u32 address, __u16 port)
+void __always_inline handle_new_path(struct iphdr* iph, struct tcphdr* tcp, __u32 address, __u16 port)
 {
-    const struct ipv4_key key = get_client_key(iph, tcp);
+    const struct ipv4_key key = get_key(iph, tcp);
     const struct tcpe_path value = {
         .address = address,
         .port = port
@@ -126,6 +138,7 @@ void __always_inline traverse_tcp_options(struct iphdr* iph, struct tcphdr* tcp,
                 bpf_print("short TCPE option");
                 return;
             }
+            bpf_print("TCPE option");
 
             __u16 magic = (opts[(i + 3)] << 8) | opts[i + 2];
             if (
@@ -143,8 +156,9 @@ void __always_inline traverse_tcp_options(struct iphdr* iph, struct tcphdr* tcp,
                     | (opts[(i + 6)] << 16)
                     | (opts[i + 5] << 8)
                     | opts[i + 4];
+                connection_id = bpf_ntohl(connection_id);
                 bpf_print("connection id %u", connection_id);
-                handle_initiation(iph, tcp, bpf_ntohl(connection_id));
+                handle_initiation(iph, tcp, connection_id);
                 return;
             }
             if (magic == TCPE_NEW_PATH)
@@ -187,8 +201,12 @@ int reader_ingress_func(struct __sk_buff* skb)
     {
         return TC_ACT_OK;
     }
-    const int server_id = get_app_id(tcp->source);
-    if (server_id < 0)
+#ifdef IS_SERVER
+    const int app_id = get_app_id(tcp->dest);
+#else
+    const int app_id = get_app_id(tcp->source);
+#endif
+    if (app_id < 0)
     {
         return TC_ACT_OK;
     }

@@ -1,3 +1,5 @@
+#pragma once
+
 #include <linux/bpf.h>
 #include <linux/filter.h>
 #include <linux/if_ether.h>
@@ -14,14 +16,15 @@
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_tracing.h>
 #include <bpf/bpf_core_read.h>
-#include <stdio.h>
 #include <asm-generic/errno.h>
-#include <sys/socket.h>
 #include <linux/bpf.h>
 #include <linux/filter.h>
 
 #include <bpf/bpf_endian.h>
 #include <bpf/bpf_helpers.h>
+
+#define AF_INET		2
+
 
 #define TCPE_KIND 254
 #define TCPE_INITIAL bpf_htons(1417)
@@ -58,40 +61,13 @@ struct __attribute__((__packed__)) tcpe_new_path
 
 struct __attribute__((__packed__)) ipv4_key
 {
-    __u32 daddr;
-    __u32 saddr;
-    __u16 dport;
-    __u16 sport;
+    __u32 server_addr;
+    __u32 client_addr;
+    __u16 server_port;
+    __u16 client_port;
 };
 
-struct
-{
-    __uint(type, BPF_MAP_TYPE_HASH);
-    __type(key, struct ipv4_key);
-    __type(value, struct tcpe);
-    __uint(pinning, LIBBPF_PIN_BY_NAME);
-    __uint(max_entries, 4096);
-} tcp_extension_ingress_map SEC(".maps");
-
-struct
-{
-    __uint(type, BPF_MAP_TYPE_HASH);
-    __type(key, struct ipv4_key);
-    __type(value, struct tcpe);
-    __uint(pinning, LIBBPF_PIN_BY_NAME);
-    __uint(max_entries, 4096);
-} tcpe_egress_map SEC(".maps");
-
-struct
-{
-    __uint(type, BPF_MAP_TYPE_HASH);
-    __type(key, __u64);
-    __type(value, __u32);
-    __uint(pinning, LIBBPF_PIN_BY_NAME);
-    __uint(max_entries, 4096);
-} pid_to_connid SEC(".maps");
-
-inline char* op_name(int op)
+inline char* op_name(const int op)
 {
     switch (op)
     {
