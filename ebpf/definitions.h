@@ -39,6 +39,8 @@ struct tcpe_path
 {
     __u32 address;
     __u16 port;
+    __u8 priority;
+    __u8 create;
 };
 
 struct __attribute__((__packed__)) tcpe_initial

@@ -100,7 +100,9 @@ int bpf_sockops(struct bpf_sock_ops* skops)
     {
         return 1;
     }
-    bpf_print("skops->op %s", op_name(skops->op));
+
+    __u64 pid_tig = bpf_get_current_pid_tgid();
+    bpf_print("skops->op %s, pid %u, syn %u", op_name(skops->op), pid_tig >> 32, skops->skb_tcp_flags & TCPHDR_SYN);
     long ret = bpf_sock_ops_cb_flags_set(skops, BPF_SOCK_OPS_WRITE_HDR_OPT_CB_FLAG);
     if (ret != 0)
     {

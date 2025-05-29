@@ -95,31 +95,48 @@ pub fn serialize_addr(ip: IpAddr, port: u16) -> [u8; 8] {
     res
 }
 
-pub fn get_new_path(
+#[derive(Debug)]
+struct PathNotification {
+    path: SocketAddr,
+    priority: u8,
+    action: Action,
+}
+
+fn get_path_notifications(
     local_sock: SocketAddr,
     remote_sock: SocketAddr,
     is_server: bool,
-) -> eyre::Result<Option<SocketAddr>> {
+) -> eyre::Result<Vec<PathNotification>> {
     let map_data = MapData::from_pin("/sys/fs/bpf/tc/globals/tcpe_path_map")
         .context("tcpe_path_map map not found")?;
-    let mut map = AyaHashMap::<MapData, [u8; 12], [u8; 8]>::try_from(Map::HashMap(map_data))?;
+    let mut map = AyaHashMap::<MapData, [u8; 16], [u8; 8]>::try_from(Map::HashMap(map_data))?;
     let key = if is_server {
         get_addr_key(remote_sock, local_sock)?
     } else {
         get_addr_key(local_sock, remote_sock)?
     };
-    let data = map.get(&key, 0).map(Some).or_else(|e| match e {
-        MapError::KeyNotFound => Ok(None),
-        e => Err(e),
-    })?;
-    if let Some(data) = data {
-        let address = Ipv4Addr::from_bits(u32::from_be_bytes((&data[0..4]).try_into().unwrap()));
-        let port = u16::from_be_bytes((&data[4..6]).try_into().unwrap());
-        map.remove(&key)?;
-        Ok(Some(SocketAddr::V4(SocketAddrV4::new(address, port))))
-    } else {
-        Ok(None)
+    let mut result = Vec::new();
+    let items = map.iter().collect::<Result<Vec<_>, _>>()?;
+    for (k, data) in items {
+        if k[..12].eq(&key) {
+            let address =
+                Ipv4Addr::from_bits(u32::from_be_bytes((&data[0..4]).try_into().unwrap()));
+            let port = u16::from_be_bytes((&data[4..6]).try_into().unwrap());
+            let priority = data[6];
+            let create = data[7];
+            map.remove(&k)?;
+            result.push(PathNotification {
+                path: SocketAddr::V4(SocketAddrV4::new(address, port)),
+                priority,
+                action: if create != 0 {
+                    Action::Create
+                } else {
+                    Action::Remove
+                },
+            });
+        }
     }
+    Ok(result)
 }
 
 // TODO: error handling
@@ -154,9 +171,29 @@ fn check_new_paths(
     local_addr: SocketAddr,
     peer_addr: SocketAddr,
 ) -> Result<(), Error> {
-    let tcpe_path = get_new_path(local_addr, peer_addr, tcpe_stream.is_server)
+    let tcpe_path = get_path_notifications(local_addr, peer_addr, tcpe_stream.is_server)
         .map_err(|e| Error::new(ErrorKind::Other, e))?;
-    tcpe_stream.remote_paths.extend(tcpe_path.into_iter());
+    let mut tcpe_path = tcpe_path.into_iter();
+    while let Some(notification) = tcpe_path.next() {
+        println!("{notification:?}");
+        match notification.action {
+            Action::Create => {
+                tcpe_stream
+                    .remote_paths
+                    .push((notification.path, notification.priority));
+            }
+            Action::Remove => {
+                tcpe_stream
+                    .remote_paths
+                    .retain(|(s, _)| s != &notification.path);
+            }
+        }
+    }
+
+    tcpe_stream
+        .remote_paths
+        .sort_unstable_by_key(|x| -(x.1 as i16));
+
     Ok(())
 }
 
@@ -179,7 +216,8 @@ pub struct TcpeStream {
     connection_id: u32,
     is_server: bool,
     streams: Vec<TcpStreamWrapper>,
-    remote_paths: Vec<SocketAddr>,
+    /// Remote paths in order of priority, first is highest
+    remote_paths: Vec<(SocketAddr, u8)>,
     local_paths: Vec<SocketAddr>,
 }
 
@@ -190,6 +228,7 @@ pub fn check(t: libc::c_int) -> io::Result<libc::c_int> {
         Ok(t)
     }
 }
+
 pub fn setsockopt<T>(
     sock: c_int,
     level: c_int,
@@ -223,7 +262,7 @@ impl TcpeStream {
             connection_id,
             is_server: false,
             local_paths: vec![initial_stream.local_addr()?],
-            remote_paths: vec![remote_sock],
+            remote_paths: vec![(remote_sock, 8)],
             streams: vec![TcpStreamWrapper {
                 tcp: initial_stream,
                 peer_addr: remote_sock,
@@ -235,7 +274,7 @@ impl TcpeStream {
         let registered_sock = self
             .remote_paths
             .iter()
-            .filter(|s| **s == remote_sock)
+            .filter(|s| s.0 == remote_sock)
             .next()
             .is_some();
 
@@ -256,21 +295,14 @@ impl TcpeStream {
             connection_id,
             is_server,
             local_paths: vec![tcp.local_addr()?],
-            remote_paths: vec![peer_addr],
+            remote_paths: vec![(peer_addr, 8)],
             streams: vec![TcpStreamWrapper { tcp, peer_addr }],
         })
     }
 
     pub fn shutdown(&mut self, shutdown: Shutdown) -> io::Result<()> {
         for s in self.streams.iter_mut() {
-            // let new_path = self.registered_paths_to_send.pop();
-            // println!("{new_path:?}");
-            let res = s.shutdown(shutdown.clone());
-            // set_notify_new_path(new_path, s, self.is_server)?;
-            // if res.is_err() {
-            // self.registered_paths_to_send.extend(new_path.into_iter());
-            // }
-            res?;
+            s.shutdown(shutdown.clone())?;
         }
         Ok(())
     }
@@ -279,19 +311,33 @@ impl TcpeStream {
     pub fn advertise(
         &mut self,
         new_path: SocketAddr,
+        priority: u8,
         send: Arc<Mutex<TransportSender>>,
     ) -> eyre::Result<()> {
-        // self.registered_paths_to_send.push(new_path);
+        assert!(priority <= 15, "priority should be in range 0-15");
 
+        // TODO
         let stream = &self.streams[0];
 
-        let new_path_option = new_path_option(new_path);
+        let new_path_option = new_path_option(new_path, priority, Action::Create);
+        send_option(send, stream, new_path_option)?;
+        Ok(())
+    }
+
+    pub fn close_path(
+        &mut self,
+        new_path: SocketAddr,
+        send: Arc<Mutex<TransportSender>>,
+    ) -> eyre::Result<()> {
+        let stream = &self.streams[0];
+
+        let new_path_option = new_path_option(new_path, 0, Action::Remove);
         send_option(send, stream, new_path_option)?;
         Ok(())
     }
 
     pub fn remote_paths(&self) -> Vec<SocketAddr> {
-        self.remote_paths.clone()
+        self.remote_paths.iter().map(|x| x.0).collect()
     }
 
     fn write_to_first_stream(&mut self, buf: &[u8]) -> io::Result<usize> {
@@ -325,7 +371,14 @@ impl TcpeStream {
 
 const TCPE_KIND: u8 = 254;
 const TCPE_NEW_PATH: u16 = 1418;
-fn new_path_option(new_path: SocketAddr) -> TcpOption {
+
+#[derive(Debug)]
+enum Action {
+    Create,
+    Remove,
+}
+
+fn new_path_option(new_path: SocketAddr, priority: u8, action: Action) -> TcpOption {
     let mut data = Vec::new();
     // struct tcpe_new_path
     // {
@@ -334,12 +387,19 @@ fn new_path_option(new_path: SocketAddr) -> TcpOption {
     //     __u16 magic; /* 1418 */
     //     __u32 address;
     //     __u16 port;
-    //     __u16 padd;
+    //     __u4 priority;
+    //     __u4 padd;
+    //     __u8 padd;
     // };
+    let action_flag = match action {
+        Action::Create => 1 << 3,
+        Action::Remove => 0,
+    };
     data.extend_from_slice(&TCPE_NEW_PATH.to_be_bytes()); // magic
     data.extend_from_slice(&ipv4(new_path.ip()).to_bits().to_be_bytes()); // address
     data.extend_from_slice(&new_path.port().to_be_bytes()); // port
-    data.extend_from_slice(&[0u8; 2]); // padding
+    data.extend_from_slice(&[(priority << 4) | action_flag; 1]); // priority and action
+    data.extend_from_slice(&[0u8; 1]); // padding
 
     TcpOption {
         number: TcpOptionNumber(TCPE_KIND),
@@ -464,22 +524,6 @@ impl TcpeHandle {
         let mut inner = self.inner.lock().unwrap();
         inner.shutdown(shutdown)
     }
-
-    /// register new path, and advertise on next packet sent
-    pub fn register(
-        &self,
-        new_path: SocketAddr,
-        send: Arc<Mutex<TransportSender>>,
-    ) -> eyre::Result<()> {
-        let mut client = self.inner.lock().map_err(|_| eyre!("Poisoned"))?;
-        client.advertise(new_path, send)
-    }
-
-    // /// register new path, and advertise immediately with empty packet
-    // pub fn advertise(&mut self, new_path: SocketAddr) -> eyre::Result<()> {
-    //     self.register(new_path)?;
-    //     Ok(())
-    // }
 
     pub fn remote_paths(&self) -> eyre::Result<Vec<SocketAddr>> {
         let mut inner = self.inner.lock().map_err(|_| eyre!("Poisoned"))?;

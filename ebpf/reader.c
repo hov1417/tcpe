@@ -30,14 +30,50 @@ struct
     __uint(max_entries, 4096);
 } tcpe_conn_map SEC(".maps");
 
+
+struct path_key
+{
+    struct ipv4_key ipv4;
+    int index;
+};
+
 struct
 {
     __uint(type, BPF_MAP_TYPE_HASH);
-    __type(key, struct ipv4_key);
+    __type(key, struct path_key);
     __type(value, struct tcpe_path);
     __uint(pinning, LIBBPF_PIN_BY_NAME);
     __uint(max_entries, 4096);
 } tcpe_path_map SEC(".maps");
+
+struct
+{
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(max_entries, 1); /* just one slot ⇒ acts like a global */
+    __type(key, __u32);
+    __type(value, __u64);
+} global SEC(".maps");
+
+int __always_inline increment_counter_and_return()
+{
+    __u32 k = 0;
+    __u64* v = bpf_map_lookup_elem(&global, &k);
+    if (v)
+    {
+        return __sync_fetch_and_add(v, 1);
+    }
+    __u32 zero = 0;
+    if (bpf_map_update_elem(&global, &k, &zero, BPF_NOEXIST) != 0)
+    {
+        v = bpf_map_lookup_elem(&global, &k);
+        if (v)
+        {
+            return __sync_fetch_and_add(v, 1);
+        }
+        bpf_print("unreachable");
+    }
+    return 0;
+}
 
 
 static __always_inline int get_app_id(__be16 port)
@@ -96,14 +132,29 @@ void __always_inline handle_initiation(struct iphdr* iph, struct tcphdr* tcp, __
     bpf_map_update_elem(&tcpe_conn_map, &key, &value, BPF_ANY);
 }
 
-void __always_inline handle_new_path(struct iphdr* iph, struct tcphdr* tcp, __u32 address, __u16 port)
+void __always_inline handle_new_path(
+    struct iphdr* iph,
+    struct tcphdr* tcp,
+    __u32 address,
+    __u16 port,
+    __u8 priority,
+    __u8 create
+)
 {
+    bpf_print("create %u", create);
     const struct ipv4_key key = get_key(iph, tcp);
+    const int index = increment_counter_and_return();
+    const struct path_key pkey = {
+        .ipv4 = key,
+        .index = index,
+    };
     const struct tcpe_path value = {
         .address = address,
-        .port = port
+        .port = port,
+        .priority = priority,
+        .create = create,
     };
-    bpf_map_update_elem(&tcpe_path_map, &key, &value, BPF_ANY);
+    bpf_map_update_elem(&tcpe_path_map, &pkey, &value, BPF_ANY);
 }
 
 void __always_inline traverse_tcp_options(struct iphdr* iph, struct tcphdr* tcp, int opt_len, __u8 opts[40])
@@ -168,7 +219,11 @@ void __always_inline traverse_tcp_options(struct iphdr* iph, struct tcphdr* tcp,
                     | (opts[i + 5] << 8)
                     | opts[i + 4];
                 __u16 port = (opts[i + 9] << 8) | (opts[i + 8]);
-                handle_new_path(iph, tcp, bpf_ntohl(address), bpf_ntohs(port));
+                __u8 priority = (opts[i + 10] >> 4);
+                __u8 create = (opts[i + 10] & 0x08) != 0;
+                bpf_print(" opts[i + 10] %u", opts[i + 10]);
+
+                handle_new_path(iph, tcp, address, port, priority, create);
                 return;
             }
         }
