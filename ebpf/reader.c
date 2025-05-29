@@ -167,7 +167,7 @@ void __always_inline traverse_tcp_options(struct iphdr* iph, struct tcphdr* tcp,
                     | (opts[(i + 6)] << 16)
                     | (opts[i + 5] << 8)
                     | opts[i + 4];
-                __u32 port = (opts[i + 9] << 8) | opts[i + 8];
+                __u16 port = (opts[i + 9] << 8) | (opts[i + 8]);
                 handle_new_path(iph, tcp, bpf_ntohl(address), bpf_ntohs(port));
                 return;
             }

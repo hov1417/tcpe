@@ -52,7 +52,7 @@ struct __attribute__((__packed__)) tcpe_initial
 struct __attribute__((__packed__)) tcpe_new_path
 {
     __u8 kind; /* 254 */
-    __u8 len; /* 8 */
+    __u8 len; /* 12 */
     __u16 magic; /* 1418 */
     __u32 address;
     __u16 port;

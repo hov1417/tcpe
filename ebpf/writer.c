@@ -36,15 +36,14 @@ static __always_inline int get_app_id(__be16 port)
     return -1;
 }
 
+#define TCPHDR_FIN 0x01
 #define TCPHDR_SYN 0x02
-
-struct
-{
-    __uint(type, BPF_MAP_TYPE_HASH);
-    __type(key, struct ipv4_key);
-    __type(value, struct tcpe_path);
-    __uint(max_entries, 4096);
-} tcpe_new_path_map SEC(".maps");
+#define TCPHDR_RST 0x04
+#define TCPHDR_PSH 0x08
+#define TCPHDR_ACK 0x10
+#define TCPHDR_URG 0x20
+#define TCPHDR_ECE 0x40
+#define TCPHDR_CWR 0x80
 
 struct
 {
@@ -120,21 +119,11 @@ int bpf_sockops(struct bpf_sock_ops* skops)
 
         if (skops->skb_tcp_flags & TCPHDR_SYN)
         {
-            size = sizeof(struct tcpe_new_path);
-        }
-        else
-        {
-            const struct ipv4_key key = get_key(skops);
-            const struct tcpe_path* new_path = bpf_map_lookup_elem(&tcpe_new_path_map, &key);
-            if (new_path != NULL)
-            {
-                size = sizeof(struct tcpe_new_path);
-            }
+            size = sizeof(struct tcpe_initial);
         }
 
         if (size != -1)
         {
-            bpf_print("hdr size");
             bpf_sock_ops_cb_flags_set(skops, BPF_SOCK_OPS_WRITE_HDR_OPT_CB_FLAG);
             skops->reply = size;
             ret = bpf_reserve_hdr_opt(skops, size, 0);
@@ -175,30 +164,8 @@ int bpf_sockops(struct bpf_sock_ops* skops)
                     bpf_print("bpf_store_hdr_opt failed");
                     break;
                 }
-                // bpf_print("writing connection hdr");
             }
-            else
-            {
-                struct tcpe_path* new_path = bpf_map_lookup_elem(&tcpe_new_path_map, &key);
-                if (new_path != NULL)
-                {
-                    struct tcpe_new_path opt = {
-                        .kind = TCPE_KIND,
-                        .len = 8,
-                        .magic = TCPE_NEW_PATH,
-                        .address = bpf_htonl(new_path->address),
-                        .port = bpf_htons(new_path->port),
-                        .padd = 0,
-                    };
 
-                    // bpf_print("writing path hdr");
-                    if (bpf_store_hdr_opt(skops, &opt, sizeof(opt), 0) != 0)
-                    {
-                        bpf_print("bpf_store_hdr_opt failed");
-                        break;
-                    }
-                }
-            }
             break;
         }
     }
