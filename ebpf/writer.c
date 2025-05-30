@@ -53,6 +53,14 @@ struct
     __uint(max_entries, 4096);
 } tcpe_conn_map SEC(".maps");
 
+struct
+{
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __type(key, __u64); // pid_tgid
+    __type(value, __u32);
+    __uint(max_entries, 4096);
+} connection_ids SEC(".maps");
+
 
 struct ipv4_key __always_inline get_key_client(struct bpf_sock_ops* skops)
 {
@@ -101,8 +109,7 @@ int bpf_sockops(struct bpf_sock_ops* skops)
         return 1;
     }
 
-    __u64 pid_tig = bpf_get_current_pid_tgid();
-    bpf_print("skops->op %s, pid %u, syn %u", op_name(skops->op), pid_tig >> 32, skops->skb_tcp_flags & TCPHDR_SYN);
+    bpf_print("skops->op %s, syn %u", op_name(skops->op), skops->skb_tcp_flags & TCPHDR_SYN);
     long ret = bpf_sock_ops_cb_flags_set(skops, BPF_SOCK_OPS_WRITE_HDR_OPT_CB_FLAG);
     if (ret != 0)
     {
@@ -144,13 +151,26 @@ int bpf_sockops(struct bpf_sock_ops* skops)
                 __u32* existing_connection = bpf_map_lookup_elem(&tcpe_conn_map, &key);
                 if (existing_connection != NULL)
                 {
-                    bpf_print("existing_connection");
                     connection_id = *existing_connection;
                 }
                 else
                 {
-                    bpf_print("not existing_connection");
-                    connection_id = bpf_get_prandom_u32();
+                    /**
+                     * bpf_get_current_pid_tgid may be confusing so here is a short explanation:
+                     * it returns
+                     * tgid << 32 | pid
+                     * here pid is the thread id, and tgid (thread group id) is the process id
+                     */
+                    __u64 pid_tgid = bpf_get_current_pid_tgid();
+                    existing_connection = bpf_map_lookup_elem(&connection_ids, &pid_tgid);
+                    if (existing_connection != NULL)
+                    {
+                        connection_id = *existing_connection;
+                    } else
+                    {
+                        connection_id = bpf_get_prandom_u32();
+                    }
+
                 }
                 bpf_print("connection_id = %u", connection_id);
 

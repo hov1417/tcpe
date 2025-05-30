@@ -7,11 +7,12 @@ use pnet::transport::{transport_channel, TransportChannelType, TransportSender};
 use pnet_packet::ip::IpNextHeaderProtocols;
 use pnet_packet::ipv4::MutableIpv4Packet;
 use pnet_packet::tcp::{MutableTcpPacket, TcpFlags, TcpOption, TcpOptionNumber};
+use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 use std::ffi::c_int;
 use std::io::{Error, ErrorKind, Read, Write};
 use std::net::{IpAddr, Ipv4Addr, Shutdown, SocketAddr, SocketAddrV4, TcpListener, TcpStream};
-use std::ops::Deref;
+use std::ops::{Deref, DerefMut};
 use std::os::fd::{AsFd, AsRawFd, FromRawFd};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::{io, mem, thread};
@@ -139,31 +140,61 @@ fn get_path_notifications(
     Ok(result)
 }
 
-// TODO: error handling
-fn read_first(stream: &mut TcpeStream, buf: &mut [u8]) -> io::Result<usize> {
-    let streams = &mut stream.streams;
-    let mut poll_fds: Vec<PollFd> = streams
-        .iter()
-        .map(|s| PollFd::new(s.as_fd(), PollFlags::POLLIN | PollFlags::POLLERR))
-        .collect();
-
-    // Block until at least one socket becomes readable
-    poll(&mut poll_fds, PollTimeout::NONE)?;
-
-    for (i, pfd) in poll_fds.iter().enumerate() {
-        let flags = pfd.revents().unwrap_or(PollFlags::empty());
-        if flags.contains(PollFlags::POLLIN) {
-            let n = streams[i].tcp.read(buf)?;
-
-            let local_addr = streams[i].local_addr()?;
-            let peer_addr = streams[i].peer_addr;
-            check_new_paths(stream, local_addr, peer_addr)?;
-            return Ok(n);
-        } else if flags.contains(PollFlags::POLLERR) {
-            println!("closed vonc vor");
+fn read_first(tcpe_stream: &mut TcpeStream, buf: &mut [u8]) -> io::Result<usize> {
+    let read = 'overall: loop {
+        let mut readables = tcpe_stream
+            .streams
+            .iter_mut()
+            .filter(|s| s.readable)
+            .collect::<Vec<_>>();
+        if readables.is_empty() {
+            if tcpe_stream.connectable_remote_paths.is_empty() {
+                break 0;
+            }
+            if !tcpe_stream
+                .new_stream(tcpe_stream.connectable_remote_paths[0].0)
+                .map_err(|e| {
+                    eprintln!("{e:?}");
+                    ErrorKind::BrokenPipe
+                })?
+            {
+                break 0;
+            }
+            continue 'overall;
         }
-    }
-    unreachable!("poll returned but no fd was ready");
+
+        let mut poll_fds: Vec<PollFd> = readables
+            .iter()
+            .map(|s| PollFd::new(s.as_fd(), PollFlags::POLLIN | PollFlags::POLLERR))
+            .collect();
+
+        // Block until at least one socket becomes readable
+        poll(&mut poll_fds, PollTimeout::NONE)?;
+
+        for (i, pfd) in poll_fds.iter().enumerate() {
+            let flags = pfd.revents().unwrap_or(PollFlags::empty());
+
+            if flags.contains(PollFlags::POLLIN) {
+                let n = readables[i].read(buf)?;
+                if n == 0 {
+                    readables[i].readable = false;
+                    continue 'overall;
+                }
+
+                let local_addr = readables[i].local_addr()?;
+                let peer_addr = readables[i].peer_addr;
+                check_new_paths(tcpe_stream, local_addr, peer_addr)?;
+                break 'overall n;
+            } else if flags.contains(PollFlags::POLLERR) {
+                println!("closed vonc vor");
+            }
+        }
+        unreachable!("poll returned but no fd was ready");
+    };
+
+    tcpe_stream.streams.retain(|s| s.readable || s.writable);
+
+    Ok(read)
 }
 
 fn check_new_paths(
@@ -173,25 +204,24 @@ fn check_new_paths(
 ) -> Result<(), Error> {
     let tcpe_path = get_path_notifications(local_addr, peer_addr, tcpe_stream.is_server)
         .map_err(|e| Error::new(ErrorKind::Other, e))?;
-    let mut tcpe_path = tcpe_path.into_iter();
-    while let Some(notification) = tcpe_path.next() {
-        println!("{notification:?}");
+    let tcpe_path = tcpe_path.into_iter();
+    for notification in tcpe_path {
         match notification.action {
             Action::Create => {
                 tcpe_stream
-                    .remote_paths
+                    .connectable_remote_paths
                     .push((notification.path, notification.priority));
             }
             Action::Remove => {
                 tcpe_stream
-                    .remote_paths
+                    .connectable_remote_paths
                     .retain(|(s, _)| s != &notification.path);
             }
         }
     }
 
     tcpe_stream
-        .remote_paths
+        .connectable_remote_paths
         .sort_unstable_by_key(|x| -(x.1 as i16));
 
     Ok(())
@@ -201,6 +231,8 @@ fn check_new_paths(
 struct TcpStreamWrapper {
     tcp: TcpStream,
     peer_addr: SocketAddr,
+    readable: bool,
+    writable: bool,
 }
 
 impl Deref for TcpStreamWrapper {
@@ -211,13 +243,19 @@ impl Deref for TcpStreamWrapper {
     }
 }
 
+impl DerefMut for TcpStreamWrapper {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.tcp
+    }
+}
+
 #[derive(Debug)]
 pub struct TcpeStream {
     connection_id: u32,
     is_server: bool,
     streams: Vec<TcpStreamWrapper>,
     /// Remote paths in order of priority, first is highest
-    remote_paths: Vec<(SocketAddr, u8)>,
+    connectable_remote_paths: Vec<(SocketAddr, u8)>,
     local_paths: Vec<SocketAddr>,
 }
 
@@ -262,27 +300,31 @@ impl TcpeStream {
             connection_id,
             is_server: false,
             local_paths: vec![initial_stream.local_addr()?],
-            remote_paths: vec![(remote_sock, 8)],
+            connectable_remote_paths: vec![(remote_sock, 8)],
             streams: vec![TcpStreamWrapper {
                 tcp: initial_stream,
                 peer_addr: remote_sock,
+                readable: true,
+                writable: true,
             }],
         })
     }
 
     pub fn new_stream(&mut self, remote_sock: SocketAddr) -> eyre::Result<bool> {
         let registered_sock = self
-            .remote_paths
+            .connectable_remote_paths
             .iter()
-            .filter(|s| s.0 == remote_sock)
-            .next()
-            .is_some();
+            .any(|s| s.0 == remote_sock);
 
         if registered_sock {
+            let pgid = get_pid_tgid();
+            store_connection_id(pgid, self.connection_id)?;
             let stream = TcpStream::connect(remote_sock)?;
             self.streams.push(TcpStreamWrapper {
                 tcp: stream,
                 peer_addr: remote_sock,
+                readable: true,
+                writable: true,
             });
         }
 
@@ -295,14 +337,19 @@ impl TcpeStream {
             connection_id,
             is_server,
             local_paths: vec![tcp.local_addr()?],
-            remote_paths: vec![(peer_addr, 8)],
-            streams: vec![TcpStreamWrapper { tcp, peer_addr }],
+            connectable_remote_paths: vec![],
+            streams: vec![TcpStreamWrapper {
+                tcp,
+                peer_addr,
+                readable: true,
+                writable: true,
+            }],
         })
     }
 
     pub fn shutdown(&mut self, shutdown: Shutdown) -> io::Result<()> {
         for s in self.streams.iter_mut() {
-            s.shutdown(shutdown.clone())?;
+            s.shutdown(shutdown)?;
         }
         Ok(())
     }
@@ -337,23 +384,27 @@ impl TcpeStream {
     }
 
     pub fn remote_paths(&self) -> Vec<SocketAddr> {
-        self.remote_paths.iter().map(|x| x.0).collect()
+        self.connectable_remote_paths.iter().map(|x| x.0).collect()
     }
 
     fn write_to_first_stream(&mut self, buf: &[u8]) -> io::Result<usize> {
-        let mut stream_index = 0;
         let mut written = 0;
-        for (i, s) in self.streams.iter_mut().enumerate() {
-            match s.tcp.write(buf) {
+        for s in self.streams.iter_mut().filter(|s| s.writable) {
+            match s.write(buf) {
                 Ok(w) => {
+                    if w == 0 {
+                        s.writable = false;
+                        continue;
+                    }
                     written = w;
-                    stream_index = i;
                 }
                 Err(e)
                     if e.kind() == ErrorKind::BrokenPipe
                         || e.kind() == ErrorKind::ConnectionReset =>
                 {
                     // this stream is broken, trying a new one
+                    s.writable = false;
+                    s.readable = false;
                     continue;
                 }
                 Err(e) => {
@@ -362,11 +413,27 @@ impl TcpeStream {
             }
         }
 
-        if stream_index != 0 {
-            self.streams.drain(0..(stream_index - 1));
-        }
+        self.streams.retain(|s| s.readable || s.writable);
         Ok(written)
     }
+}
+
+fn store_connection_id(pid_tgid: u64, connection_id: u32) -> eyre::Result<()> {
+    let map_data = MapData::from_pin("/sys/fs/bpf/tc/globals/connection_ids")
+        .context("connection_ids map not found")?;
+    let mut connection_ids = AyaHashMap::<MapData, u64, u32>::try_from(Map::HashMap(map_data))?;
+
+    connection_ids.insert(pid_tgid, connection_id, 0)?;
+
+    Ok(())
+}
+
+fn get_pid_tgid() -> u64 {
+    let pid = unsafe { libc::getpid() };
+    let pgid = unsafe { libc::getpgid(pid) };
+    let pid = pid as u64;
+    let pgid = pgid as u64;
+    (pgid << 32) | pid
 }
 
 const TCPE_KIND: u8 = 254;
@@ -475,7 +542,7 @@ fn sent_empty_packet(
         tcp.set_checksum(csum);
     }
 
-    send.send_to(&MutableIpv4Packet::new(&mut buf).unwrap(), dest_addr.into())?;
+    send.send_to(MutableIpv4Packet::new(&mut buf).unwrap(), dest_addr.into())?;
     Ok(())
 }
 
@@ -520,6 +587,31 @@ impl TcpeHandle {
         inner.new_stream(remote_sock)
     }
 
+    fn from_stream(s: TcpeStream) -> eyre::Result<Self> {
+        Ok(TcpeHandle {
+            inner: Arc::new(Mutex::new(s)),
+        })
+    }
+
+    pub fn advertise(
+        &self,
+        new_path: SocketAddr,
+        priority: u8,
+        send: Arc<Mutex<TransportSender>>,
+    ) -> eyre::Result<()> {
+        let mut inner = self.inner.lock().map_err(|_| eyre!("Poisoned"))?;
+        inner.advertise(new_path, priority, send)
+    }
+
+    pub fn close_path(
+        &mut self,
+        new_path: SocketAddr,
+        send: Arc<Mutex<TransportSender>>,
+    ) -> eyre::Result<()> {
+        let mut inner = self.inner.lock().map_err(|_| eyre!("Poisoned"))?;
+        inner.close_path(new_path, send)
+    }
+
     pub fn shutdown(&self, shutdown: Shutdown) -> io::Result<()> {
         let mut inner = self.inner.lock().unwrap();
         inner.shutdown(shutdown)
@@ -543,6 +635,8 @@ impl TcpeHandle {
         inner.streams.push(TcpStreamWrapper {
             peer_addr: tcp_stream.peer_addr()?,
             tcp: tcp_stream,
+            readable: true,
+            writable: true,
         });
         Ok(())
     }
@@ -567,7 +661,7 @@ impl Read for TcpeHandle {
 }
 
 // TODO: error handling
-fn listen_first(sockets: &[TcpListener]) -> io::Result<TcpStream> {
+fn accept_first(sockets: &[TcpListener]) -> io::Result<TcpStream> {
     let mut poll_fds: Vec<PollFd> = sockets
         .iter()
         .map(|s| PollFd::new(s.as_fd(), PollFlags::POLLIN))
@@ -608,19 +702,26 @@ impl TcpeServer {
         Ok(())
     }
 
-    pub fn accept(&mut self) -> eyre::Result<TcpeStream> {
-        let stream = listen_first(&self.listeners)?;
+    pub fn accept(&mut self) -> eyre::Result<TcpeHandle> {
+        let stream = accept_first(&self.listeners)?;
         let server_sock = stream.local_addr()?;
         let client_sock = stream.peer_addr()?;
         let connection_id = get_connection_id(client_sock, server_sock)?;
         let Some(connection_id) = connection_id else {
             bail!("Connection ID not found");
         };
-        if let Some(state) = self.connections.get_mut(&connection_id) {
-            state.add_stream(stream)?;
-            return self.accept();
+        match self.connections.entry(connection_id) {
+            Entry::Occupied(mut state) => {
+                state.get_mut().add_stream(stream)?;
+                self.accept()
+            }
+            Entry::Vacant(v) => {
+                let stream = TcpeStream::from_stream(stream, connection_id, true)?;
+                let handle = TcpeHandle::from_stream(stream)?;
+                v.insert(handle.clone());
+                Ok(handle)
+            }
         }
-        let stream = TcpeStream::from_stream(stream, connection_id, true)?;
 
         // for s in self.listeners.iter() {
         //     let addr = s.local_addr()?;
@@ -629,14 +730,13 @@ impl TcpeServer {
         //     }
         // }
 
-        Ok(stream)
+        // Ok(stream)
     }
 }
 
 const BUFFER_SIZE: usize = 4096;
 
-pub static SEQ_NUMS: LazyLock<DashMap<(SocketAddr, SocketAddr), u32>> =
-    LazyLock::new(|| DashMap::new());
+pub static SEQ_NUMS: LazyLock<DashMap<(SocketAddr, SocketAddr), u32>> = LazyLock::new(DashMap::new);
 
 pub fn raw_tcp_socket() -> eyre::Result<TransportSender> {
     use pnet::datalink::{self, Channel, Config};
@@ -663,7 +763,6 @@ pub fn raw_tcp_socket() -> eyre::Result<TransportSender> {
 
     thread::spawn(move || {
         let mut rx = rx;
-        // let mut iter = ipv4_packet_iter(&mut rx);
         loop {
             let frame = rx.next().unwrap();
             let Some(eth) = EthernetPacket::new(frame) else {
