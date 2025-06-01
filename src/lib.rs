@@ -1,21 +1,34 @@
+mod base64_bytes;
+pub mod handoff;
+
+use crate::handoff::{TcpeHandoffEnd, TcpeHandoffStart};
 use aya::maps::{HashMap as AyaHashMap, Map, MapData, MapError};
-use dashmap::DashMap;
+use dashmap::{DashMap, Entry};
 use eyre::{bail, eyre, Context, ContextCompat};
 use nix::poll::{poll, PollFd, PollFlags, PollTimeout};
+use pnet::datalink;
+use pnet::datalink::Channel;
+use pnet::datalink::Config;
+use pnet::packet::ethernet::EtherTypes;
+use pnet::packet::ethernet::EthernetPacket;
+use pnet::packet::ip::IpNextHeaderProtocols;
+use pnet::packet::ipv4::Ipv4Packet;
+use pnet::packet::tcp::TcpPacket;
+use pnet::packet::Packet;
 use pnet::packet::{ipv4::checksum as ip_checksum, tcp::ipv4_checksum};
 use pnet::transport::{transport_channel, TransportChannelType, TransportSender};
-use pnet_packet::ip::IpNextHeaderProtocols;
 use pnet_packet::ipv4::MutableIpv4Packet;
 use pnet_packet::tcp::{MutableTcpPacket, TcpFlags, TcpOption, TcpOptionNumber};
-use std::collections::hash_map::Entry;
-use std::collections::HashMap;
+use std::collections::{HashSet, VecDeque};
 use std::ffi::c_int;
 use std::io::{Error, ErrorKind, Read, Write};
 use std::net::{IpAddr, Ipv4Addr, Shutdown, SocketAddr, SocketAddrV4, TcpListener, TcpStream};
-use std::ops::{Deref, DerefMut};
+use std::ops::{Deref, DerefMut, Not};
 use std::os::fd::{AsFd, AsRawFd, FromRawFd};
-use std::sync::{Arc, LazyLock, Mutex};
-use std::{io, mem, thread};
+use std::sync::mpsc::{sync_channel, SyncSender};
+use std::sync::{mpsc, Arc, LazyLock, Mutex, MutexGuard};
+use std::time::Duration;
+use std::{io, thread};
 
 pub const SERVER_IP: IpAddr = IpAddr::V4(Ipv4Addr::new(192, 168, 2, 79));
 pub const SERVER_PORT: u16 = 8080;
@@ -74,7 +87,7 @@ pub fn get_key(
     server_port: u16,
 ) -> [u8; 12] {
     let (IpAddr::V4(server_ip), IpAddr::V4(client_ip)) = (server_ip, client_ip) else {
-        panic!("AAAAAAAAAAA!!!!!!!!!")
+        panic!("Currently only supporting Ipv4")
     };
     let mut res = [0_u8; 12];
     res[0..4].copy_from_slice(&server_ip.to_bits().to_be_bytes());
@@ -87,7 +100,7 @@ pub fn get_key(
 
 pub fn serialize_addr(ip: IpAddr, port: u16) -> [u8; 8] {
     let IpAddr::V4(ip) = ip else {
-        panic!("AAAAAAAAAAA!!!!!!!!!")
+        panic!("Currently only supporting Ipv4")
     };
     let mut res = [0_u8; 8];
     res[0..4].copy_from_slice(&ip.to_bits().to_be_bytes());
@@ -120,9 +133,8 @@ fn get_path_notifications(
     let items = map.iter().collect::<Result<Vec<_>, _>>()?;
     for (k, data) in items {
         if k[..12].eq(&key) {
-            let address =
-                Ipv4Addr::from_bits(u32::from_be_bytes((&data[0..4]).try_into().unwrap()));
-            let port = u16::from_be_bytes((&data[4..6]).try_into().unwrap());
+            let address = Ipv4Addr::from_bits(u32::from_be_bytes((&data[0..4]).try_into()?));
+            let port = u16::from_be_bytes((&data[4..6]).try_into()?);
             let priority = data[6];
             let create = data[7];
             map.remove(&k)?;
@@ -140,63 +152,6 @@ fn get_path_notifications(
     Ok(result)
 }
 
-fn read_first(tcpe_stream: &mut TcpeStream, buf: &mut [u8]) -> io::Result<usize> {
-    let read = 'overall: loop {
-        let mut readables = tcpe_stream
-            .streams
-            .iter_mut()
-            .filter(|s| s.readable)
-            .collect::<Vec<_>>();
-        if readables.is_empty() {
-            if tcpe_stream.connectable_remote_paths.is_empty() {
-                break 0;
-            }
-            if !tcpe_stream
-                .new_stream(tcpe_stream.connectable_remote_paths[0].0)
-                .map_err(|e| {
-                    eprintln!("{e:?}");
-                    ErrorKind::BrokenPipe
-                })?
-            {
-                break 0;
-            }
-            continue 'overall;
-        }
-
-        let mut poll_fds: Vec<PollFd> = readables
-            .iter()
-            .map(|s| PollFd::new(s.as_fd(), PollFlags::POLLIN | PollFlags::POLLERR))
-            .collect();
-
-        // Block until at least one socket becomes readable
-        poll(&mut poll_fds, PollTimeout::NONE)?;
-
-        for (i, pfd) in poll_fds.iter().enumerate() {
-            let flags = pfd.revents().unwrap_or(PollFlags::empty());
-
-            if flags.contains(PollFlags::POLLIN) {
-                let n = readables[i].read(buf)?;
-                if n == 0 {
-                    readables[i].readable = false;
-                    continue 'overall;
-                }
-
-                let local_addr = readables[i].local_addr()?;
-                let peer_addr = readables[i].peer_addr;
-                check_new_paths(tcpe_stream, local_addr, peer_addr)?;
-                break 'overall n;
-            } else if flags.contains(PollFlags::POLLERR) {
-                println!("closed vonc vor");
-            }
-        }
-        unreachable!("poll returned but no fd was ready");
-    };
-
-    tcpe_stream.streams.retain(|s| s.readable || s.writable);
-
-    Ok(read)
-}
-
 fn check_new_paths(
     tcpe_stream: &mut TcpeStream,
     local_addr: SocketAddr,
@@ -208,34 +163,123 @@ fn check_new_paths(
     for notification in tcpe_path {
         match notification.action {
             Action::Create => {
+                // if same priority exists, last notification should be in front,
+                // then we use stable sort
                 tcpe_stream
                     .connectable_remote_paths
-                    .push((notification.path, notification.priority));
+                    .push_front((notification.path, notification.priority));
             }
             Action::Remove => {
                 tcpe_stream
                     .connectable_remote_paths
                     .retain(|(s, _)| s != &notification.path);
+                // marking related streams for removal
+                tcpe_stream
+                    .streams
+                    .iter_mut()
+                    .flat_map(|s| s.as_tcp_mut())
+                    .filter(|s| s.peer_addr == notification.path)
+                    .for_each(|s| {
+                        s.readable = false;
+                        s.writable = false;
+                    })
             }
         }
     }
 
     tcpe_stream
         .connectable_remote_paths
-        .sort_unstable_by_key(|x| -(x.1 as i16));
+        .make_contiguous()
+        .sort_by_key(|x| -(x.1 as i16));
 
     Ok(())
 }
 
 #[derive(Debug)]
-struct TcpStreamWrapper {
+struct TcpStreamWithMeta {
     tcp: TcpStream,
     peer_addr: SocketAddr,
     readable: bool,
     writable: bool,
 }
 
-impl Deref for TcpStreamWrapper {
+#[derive(Debug)]
+struct TcpStreamMoved {
+    data: VecDeque<u8>,
+    channel: Option<mpsc::Receiver<Vec<u8>>>,
+}
+
+impl TcpStreamMoved {
+    #[inline]
+    fn is_empty(&self) -> bool {
+        self.data.is_empty() && self.channel.is_none()
+    }
+}
+
+impl Read for TcpStreamMoved {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if self.data.is_empty() {
+            if let Some(ch) = self.channel.take() {
+                match ch.recv() {
+                    Ok(d) => {
+                        self.data.extend(&d);
+                        self.read(buf)
+                    }
+                    Err(_) => Ok(0),
+                }
+            } else {
+                Ok(0)
+            }
+        } else {
+            self.data.read(buf)
+        }
+    }
+}
+
+#[derive(Debug)]
+enum TcpeStreamSubflow {
+    Tcp(TcpStreamWithMeta),
+    HandedOff(TcpStreamMoved),
+}
+
+impl TcpeStreamSubflow {
+    fn readable(&self) -> bool {
+        match self {
+            TcpeStreamSubflow::Tcp(t) => t.readable,
+            TcpeStreamSubflow::HandedOff(b) => !b.is_empty(),
+        }
+    }
+
+    fn writable(&self) -> bool {
+        match self {
+            TcpeStreamSubflow::Tcp(t) => t.writable,
+            TcpeStreamSubflow::HandedOff(_) => false,
+        }
+    }
+
+    fn as_tcp(&self) -> Option<&TcpStreamWithMeta> {
+        match self {
+            TcpeStreamSubflow::Tcp(t) => Some(t),
+            TcpeStreamSubflow::HandedOff(_) => None,
+        }
+    }
+
+    fn as_tcp_mut(&mut self) -> Option<&mut TcpStreamWithMeta> {
+        match self {
+            TcpeStreamSubflow::Tcp(t) => Some(t),
+            TcpeStreamSubflow::HandedOff(_) => None,
+        }
+    }
+
+    fn as_read(&mut self) -> Option<&mut impl Read> {
+        match self {
+            TcpeStreamSubflow::Tcp(_) => None,
+            TcpeStreamSubflow::HandedOff(d) => Some(d),
+        }
+    }
+}
+
+impl Deref for TcpStreamWithMeta {
     type Target = TcpStream;
 
     fn deref(&self) -> &Self::Target {
@@ -243,7 +287,7 @@ impl Deref for TcpStreamWrapper {
     }
 }
 
-impl DerefMut for TcpStreamWrapper {
+impl DerefMut for TcpStreamWithMeta {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.tcp
     }
@@ -253,9 +297,10 @@ impl DerefMut for TcpStreamWrapper {
 pub struct TcpeStream {
     connection_id: u32,
     is_server: bool,
-    streams: Vec<TcpStreamWrapper>,
+    streams: Vec<TcpeStreamSubflow>,
     /// Remote paths in order of priority, first is highest
-    connectable_remote_paths: Vec<(SocketAddr, u8)>,
+    connectable_remote_paths: VecDeque<(SocketAddr, u8)>,
+    // TODO
     local_paths: Vec<SocketAddr>,
 }
 
@@ -279,7 +324,7 @@ pub fn setsockopt<T>(
             level,
             option_name,
             (&raw const option_value) as *const _,
-            mem::size_of::<T>() as libc::socklen_t,
+            size_of::<T>() as libc::socklen_t,
         ))?;
         Ok(())
     }
@@ -300,13 +345,15 @@ impl TcpeStream {
             connection_id,
             is_server: false,
             local_paths: vec![initial_stream.local_addr()?],
-            connectable_remote_paths: vec![(remote_sock, 8)],
-            streams: vec![TcpStreamWrapper {
-                tcp: initial_stream,
-                peer_addr: remote_sock,
-                readable: true,
-                writable: true,
-            }],
+            connectable_remote_paths: vec![(remote_sock, 8)].into(),
+            streams: vec![
+                (TcpeStreamSubflow::Tcp(TcpStreamWithMeta {
+                    tcp: initial_stream,
+                    peer_addr: remote_sock,
+                    readable: true,
+                    writable: true,
+                })),
+            ],
         })
     }
 
@@ -317,18 +364,24 @@ impl TcpeStream {
             .any(|s| s.0 == remote_sock);
 
         if registered_sock {
-            let pgid = get_pid_tgid();
-            store_connection_id(pgid, self.connection_id)?;
-            let stream = TcpStream::connect(remote_sock)?;
-            self.streams.push(TcpStreamWrapper {
-                tcp: stream,
-                peer_addr: remote_sock,
-                readable: true,
-                writable: true,
-            });
+            self.new_stream_unchecked(remote_sock)?;
         }
 
         Ok(registered_sock)
+    }
+
+    fn new_stream_unchecked(&mut self, remote_sock: SocketAddr) -> eyre::Result<()> {
+        let pgid = get_pid_and_thread_group_id();
+        store_connection_id(pgid, self.connection_id)?;
+        let stream = TcpStream::connect(remote_sock)?;
+        self.streams.push(TcpeStreamSubflow::Tcp(TcpStreamWithMeta {
+            tcp: stream,
+            peer_addr: remote_sock,
+            readable: true,
+            writable: true,
+        }));
+
+        Ok(())
     }
 
     fn from_stream(tcp: TcpStream, connection_id: u32, is_server: bool) -> eyre::Result<Self> {
@@ -337,19 +390,49 @@ impl TcpeStream {
             connection_id,
             is_server,
             local_paths: vec![tcp.local_addr()?],
-            connectable_remote_paths: vec![],
-            streams: vec![TcpStreamWrapper {
+            connectable_remote_paths: VecDeque::new(),
+            streams: vec![TcpeStreamSubflow::Tcp(TcpStreamWithMeta {
                 tcp,
                 peer_addr,
                 readable: true,
                 writable: true,
-            }],
+            })],
+        })
+    }
+
+    fn handoff_start(
+        tcp: TcpeHandoffStart,
+        channel: mpsc::Receiver<Vec<u8>>,
+    ) -> eyre::Result<Self> {
+        Ok(TcpeStream {
+            connection_id: tcp.connection_id,
+            is_server: true,
+            local_paths: vec![],
+            connectable_remote_paths: VecDeque::new(),
+            streams: vec![TcpeStreamSubflow::HandedOff(TcpStreamMoved {
+                data: tcp.current_data.into(),
+                channel: Some(channel),
+            })],
         })
     }
 
     pub fn shutdown(&mut self, shutdown: Shutdown) -> io::Result<()> {
-        for s in self.streams.iter_mut() {
-            s.shutdown(shutdown)?;
+        for s in self.streams.iter_mut().flat_map(|s| s.as_tcp_mut()) {
+            match shutdown {
+                Shutdown::Read => {
+                    s.readable = false;
+                }
+                Shutdown::Write => {
+                    s.writable = false;
+                }
+                Shutdown::Both => {
+                    s.readable = false;
+                    s.writable = false;
+                }
+            }
+            if let Err(e) = s.shutdown(shutdown) {
+                eprintln!("Shutting down caused {e:?}, skipping");
+            }
         }
         Ok(())
     }
@@ -363,8 +446,9 @@ impl TcpeStream {
     ) -> eyre::Result<()> {
         assert!(priority <= 15, "priority should be in range 0-15");
 
-        // TODO
-        let stream = &self.streams[0];
+        let Some(stream) = &self.streams.iter().flat_map(|s| s.as_tcp()).next() else {
+            bail!("No TcpStream available")
+        };
 
         let new_path_option = new_path_option(new_path, priority, Action::Create);
         send_option(send, stream, new_path_option)?;
@@ -376,7 +460,9 @@ impl TcpeStream {
         new_path: SocketAddr,
         send: Arc<Mutex<TransportSender>>,
     ) -> eyre::Result<()> {
-        let stream = &self.streams[0];
+        let Some(stream) = &self.streams.iter().flat_map(|s| s.as_tcp()).next() else {
+            bail!("No TcpStream available")
+        };
 
         let new_path_option = new_path_option(new_path, 0, Action::Remove);
         send_option(send, stream, new_path_option)?;
@@ -388,33 +474,77 @@ impl TcpeStream {
     }
 
     fn write_to_first_stream(&mut self, buf: &[u8]) -> io::Result<usize> {
-        let mut written = 0;
-        for s in self.streams.iter_mut().filter(|s| s.writable) {
+        let written = loop {
+            let writable = self
+                .streams
+                .iter_mut()
+                .filter(|s| s.writable())
+                .flat_map(|s| s.as_tcp_mut())
+                .next();
+
+            if writable.is_none() {
+                println!("Empty streams");
+                if self.connectable_remote_paths.is_empty() {
+                    break 0;
+                }
+
+                println!("trying new streams");
+                if !self
+                    .new_stream(self.connectable_remote_paths[0].0)
+                    .map_err(|e| {
+                        eprintln!("{e:?}");
+                        ErrorKind::BrokenPipe
+                    })?
+                {
+                    println!("unsuccessfully new streams");
+                    break 0;
+                }
+                continue;
+            }
+            let s = writable.unwrap();
+
+            println!("writing data to {:?}", s.peer_addr);
             match s.write(buf) {
                 Ok(w) => {
                     if w == 0 {
                         s.writable = false;
                         continue;
                     }
-                    written = w;
+                    break w;
                 }
                 Err(e)
                     if e.kind() == ErrorKind::BrokenPipe
                         || e.kind() == ErrorKind::ConnectionReset =>
                 {
+                    eprintln!("Subflow is broken: {e:?}");
                     // this stream is broken, trying a new one
                     s.writable = false;
                     s.readable = false;
                     continue;
                 }
                 Err(e) => {
+                    eprintln!("Error writing {e:?}");
                     return Err(e);
                 }
             }
-        }
+        };
 
-        self.streams.retain(|s| s.readable || s.writable);
+        self.cleanup();
         Ok(written)
+    }
+
+    fn cleanup(&mut self) {
+        let mut unreachable_remotes = HashSet::new();
+        self.streams.retain(|s| {
+            if !s.readable() && !s.writable() {
+                if let Some(s) = s.as_tcp() {
+                    unreachable_remotes.insert(s.peer_addr);
+                }
+            }
+            s.readable() || s.writable()
+        });
+        self.connectable_remote_paths
+            .retain(|(s, _)| !unreachable_remotes.contains(s));
     }
 }
 
@@ -428,7 +558,7 @@ fn store_connection_id(pid_tgid: u64, connection_id: u32) -> eyre::Result<()> {
     Ok(())
 }
 
-fn get_pid_tgid() -> u64 {
+fn get_pid_and_thread_group_id() -> u64 {
     let pid = unsafe { libc::getpid() };
     let pgid = unsafe { libc::getpgid(pid) };
     let pid = pid as u64;
@@ -447,17 +577,6 @@ enum Action {
 
 fn new_path_option(new_path: SocketAddr, priority: u8, action: Action) -> TcpOption {
     let mut data = Vec::new();
-    // struct tcpe_new_path
-    // {
-    //     __u8 kind; /* 254 */
-    //     __u8 len; /* 12 */
-    //     __u16 magic; /* 1418 */
-    //     __u32 address;
-    //     __u16 port;
-    //     __u4 priority;
-    //     __u4 padd;
-    //     __u8 padd;
-    // };
     let action_flag = match action {
         Action::Create => 1 << 3,
         Action::Remove => 0,
@@ -477,7 +596,7 @@ fn new_path_option(new_path: SocketAddr, priority: u8, action: Action) -> TcpOpt
 
 fn send_option(
     send: Arc<Mutex<TransportSender>>,
-    stream: &TcpStreamWrapper,
+    stream: &TcpStreamWithMeta,
     option: TcpOption,
 ) -> eyre::Result<()> {
     let seq_num = *SEQ_NUMS
@@ -493,7 +612,7 @@ fn send_option(
 
 fn sent_empty_packet(
     send: Arc<Mutex<TransportSender>>,
-    stream: &TcpStreamWrapper,
+    stream: &TcpStreamWithMeta,
     seq_num: u32,
     src_addr: Ipv4Addr,
     dest_addr: Ipv4Addr,
@@ -564,15 +683,16 @@ impl Write for TcpeStream {
     }
 }
 
-impl Read for TcpeStream {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        read_first(self, buf)
-    }
-}
-
 #[derive(Clone, Debug)]
 pub struct TcpeHandle {
     inner: Arc<Mutex<TcpeStream>>,
+}
+
+impl TcpeHandle {
+    fn cleanup(&self) {
+        let mut inner = self.inner.lock().map_err(|_| eyre!("Poisoned")).unwrap();
+        inner.cleanup()
+    }
 }
 
 impl TcpeHandle {
@@ -619,33 +739,63 @@ impl TcpeHandle {
 
     pub fn remote_paths(&self) -> eyre::Result<Vec<SocketAddr>> {
         let mut inner = self.inner.lock().map_err(|_| eyre!("Poisoned"))?;
+        self.remote_paths_inner(&mut inner)
+    }
+
+    fn remote_paths_inner(
+        &self,
+        inner: &mut MutexGuard<TcpeStream>,
+    ) -> eyre::Result<Vec<SocketAddr>> {
         let addresses = inner
             .streams
             .iter()
+            .flat_map(|s| s.as_tcp())
             .map(|s| (s.local_addr().unwrap(), s.peer_addr))
             .collect::<Vec<_>>();
         for (l, p) in addresses {
-            check_new_paths(&mut inner, l, p)?
+            check_new_paths(inner, l, p)?
         }
         Ok(inner.remote_paths())
     }
 
+    pub fn connection_id(&self) -> u32 {
+        let inner = self.inner.lock().unwrap();
+        inner.connection_id
+    }
+
     fn add_stream(&mut self, tcp_stream: TcpStream) -> eyre::Result<()> {
         let mut inner = self.inner.lock().map_err(|_| eyre!("Poisoned"))?;
-        inner.streams.push(TcpStreamWrapper {
-            peer_addr: tcp_stream.peer_addr()?,
-            tcp: tcp_stream,
-            readable: true,
-            writable: true,
-        });
+        inner
+            .streams
+            .push(TcpeStreamSubflow::Tcp(TcpStreamWithMeta {
+                peer_addr: tcp_stream.peer_addr()?,
+                tcp: tcp_stream,
+                readable: true,
+                writable: true,
+            }));
         Ok(())
     }
 }
 
 impl Write for TcpeHandle {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        let mut client = self.inner.lock().map_err(|_| ErrorKind::BrokenPipe)?;
-        client.write(buf)
+        let mut inner = self.inner.lock().map_err(|_| ErrorKind::BrokenPipe)?;
+        if inner.streams.is_empty() {
+            return Ok(0);
+        }
+        let remotes = self
+            .remote_paths_inner(&mut inner)
+            .map_err(|e| Error::new(ErrorKind::Other, e))?;
+        if !remotes.is_empty() {
+            if let Some(s) = inner.streams[0].as_tcp() {
+                if s.peer_addr != remotes[0] {
+                    inner
+                        .new_stream_unchecked(remotes[0])
+                        .map_err(|e| Error::new(ErrorKind::Other, e))?;
+                }
+            }
+        }
+        inner.write(buf)
     }
 
     fn flush(&mut self) -> io::Result<()> {
@@ -655,8 +805,96 @@ impl Write for TcpeHandle {
 
 impl Read for TcpeHandle {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        let mut client = self.inner.lock().map_err(|_| ErrorKind::BrokenPipe)?;
-        read_first(&mut client, buf)
+        let read = 'overall: loop {
+            let mut tcpe_stream = self.inner.lock().map_err(|_| ErrorKind::BrokenPipe)?;
+            let existing_data = tcpe_stream
+                .streams
+                .iter_mut()
+                .flat_map(|s| s.as_read())
+                .next();
+            if let Some(data) = existing_data {
+                break 'overall data.read(buf)?;
+            }
+            let mut readables = tcpe_stream
+                .streams
+                .iter_mut()
+                .filter(|s| s.readable())
+                .flat_map(|s| s.as_tcp_mut())
+                .collect::<Vec<_>>();
+
+            if readables.is_empty() {
+                println!("Empty streams");
+                if tcpe_stream.connectable_remote_paths.is_empty() {
+                    break 'overall 0;
+                }
+
+                println!("trying new streams");
+                let addr = tcpe_stream.connectable_remote_paths[0].0;
+                if !tcpe_stream.new_stream(addr).map_err(|e| {
+                    eprintln!("{e:?}");
+                    ErrorKind::BrokenPipe
+                })? {
+                    println!("unsuccessfully new streams");
+                    break 'overall 0;
+                }
+                continue 'overall;
+            }
+
+            let mut poll_fds: Vec<PollFd> = readables
+                .iter()
+                .map(|s| {
+                    PollFd::new(
+                        s.as_fd(),
+                        PollFlags::all() & (PollFlags::POLLOUT | PollFlags::POLLWRNORM).not(),
+                    )
+                })
+                .collect();
+
+            println!("waiting for a data");
+
+            let timeout: PollTimeout = Duration::from_millis(10).try_into().unwrap();
+            poll(&mut poll_fds, timeout).map_err(|e| {
+                eprintln!("Error while polling {e:?}");
+                e
+            })?;
+            println!("Poll emitted event");
+
+            for (i, pfd) in poll_fds.iter().enumerate() {
+                let flags = pfd.revents().unwrap_or(PollFlags::empty());
+
+                if flags.contains(PollFlags::POLLIN) {
+                    let n = match readables[i].read(buf) {
+                        Ok(read) => read,
+                        Err(e)
+                            if e.kind() == ErrorKind::BrokenPipe
+                                || e.kind() == ErrorKind::ConnectionReset =>
+                        {
+                            println!("Error after stream polled, retrying");
+                            continue 'overall;
+                        }
+                        Err(e) => {
+                            eprintln!("Error polling {e:?}");
+                            return Err(e);
+                        }
+                    };
+                    if n == 0 {
+                        readables[i].readable = false;
+                        continue 'overall;
+                    }
+
+                    let local_addr = readables[i].local_addr()?;
+                    let peer_addr = readables[i].peer_addr;
+                    check_new_paths(&mut tcpe_stream, local_addr, peer_addr)?;
+                    break 'overall n;
+                } else {
+                    println!("Other event {:?}", flags);
+                }
+            }
+        };
+
+        self.cleanup();
+
+        Ok(read)
     }
 }
 
@@ -684,7 +922,8 @@ fn accept_first(sockets: &[TcpListener]) -> io::Result<TcpStream> {
 
 pub struct TcpeServer {
     listeners: Vec<TcpListener>,
-    connections: HashMap<u32, TcpeHandle>,
+    connections: DashMap<u32, TcpeHandle>,
+    handoff: DashMap<u32, SyncSender<Vec<u8>>>,
 }
 
 impl TcpeServer {
@@ -692,7 +931,8 @@ impl TcpeServer {
         let inner = TcpListener::bind(sock)?;
         Ok(Self {
             listeners: vec![inner],
-            connections: HashMap::new(),
+            connections: DashMap::new(),
+            handoff: DashMap::new(),
         })
     }
 
@@ -702,7 +942,32 @@ impl TcpeServer {
         Ok(())
     }
 
-    pub fn accept(&mut self) -> eyre::Result<TcpeHandle> {
+    pub fn handoff_start(&self, handoff: TcpeHandoffStart) -> eyre::Result<TcpeHandle> {
+        match self.connections.entry(handoff.connection_id) {
+            Entry::Occupied(_) => {
+                bail!("handoff connection already exists")
+            }
+            Entry::Vacant(v) => {
+                let (sender, receiver) = sync_channel(1);
+                self.handoff.insert(handoff.connection_id, sender);
+                let stream = TcpeStream::handoff_start(handoff, receiver)?;
+                let handle = TcpeHandle::from_stream(stream)?;
+                v.insert(handle.clone());
+                Ok(handle)
+            }
+        }
+    }
+
+    pub fn handoff_end(&self, handoff: TcpeHandoffEnd) -> eyre::Result<()> {
+        if let Some((_, sender)) = self.handoff.remove(&handoff.connection_id) {
+            sender.send(handoff.left_over_data)?;
+            Ok(())
+        } else {
+            bail!("handoff connection not found");
+        }
+    }
+
+    pub fn accept(&self) -> eyre::Result<TcpeHandle> {
         let stream = accept_first(&self.listeners)?;
         let server_sock = stream.local_addr()?;
         let client_sock = stream.peer_addr()?;
@@ -722,15 +987,6 @@ impl TcpeServer {
                 Ok(handle)
             }
         }
-
-        // for s in self.listeners.iter() {
-        //     let addr = s.local_addr()?;
-        //     if addr != server_sock {
-        //         stream.advertise(addr)?;
-        //     }
-        // }
-
-        // Ok(stream)
     }
 }
 
@@ -739,15 +995,6 @@ const BUFFER_SIZE: usize = 4096;
 pub static SEQ_NUMS: LazyLock<DashMap<(SocketAddr, SocketAddr), u32>> = LazyLock::new(DashMap::new);
 
 pub fn raw_tcp_socket() -> eyre::Result<TransportSender> {
-    use pnet::datalink::{self, Channel, Config};
-    use pnet::packet::{
-        ethernet::{EtherTypes, EthernetPacket},
-        ip::IpNextHeaderProtocols,
-        ipv4::Ipv4Packet,
-        tcp::TcpPacket,
-        Packet,
-    };
-
     // pick the interface you really use
     let iface = datalink::interfaces()
         .into_iter()

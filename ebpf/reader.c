@@ -3,6 +3,7 @@
  * reads and stores all info related to TCPE
  */
 
+// TODO RST/FIN cleanup
 #include "definitions.h"
 
 #ifdef IS_SERVER
