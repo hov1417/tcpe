@@ -3,5 +3,4 @@ TODO
 - if connection is lost, and server doesn't receive new connection after notified connection handoff (with some timeout),
  and client continues sending data to LB IP, client continues using write direction as well through LB, in other words it falls back to classic layer 7 LB
 - If handoff start or handoff end fails (both are send and recv) LB selects another RS
-- ebpf also listens to FIN/RST packets, and removes those values from maps
 - Recheck 6.2.4 Load balancer handoff protocol, error handling

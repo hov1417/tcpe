@@ -374,6 +374,7 @@ impl TcpeStream {
         let pgid = get_pid_and_thread_group_id();
         store_connection_id(pgid, self.connection_id)?;
         let stream = TcpStream::connect(remote_sock)?;
+        remove_connection_id(pgid)?;
         self.streams.push(TcpeStreamSubflow::Tcp(TcpStreamWithMeta {
             tcp: stream,
             peer_addr: remote_sock,
@@ -494,6 +495,16 @@ fn store_connection_id(pid_tgid: u64, connection_id: u32) -> eyre::Result<()> {
     let mut connection_ids = AyaHashMap::<MapData, u64, u32>::try_from(Map::HashMap(map_data))?;
 
     connection_ids.insert(pid_tgid, connection_id, 0)?;
+
+    Ok(())
+}
+
+fn remove_connection_id(pid_tgid: u64) -> eyre::Result<()> {
+    let map_data = MapData::from_pin("/sys/fs/bpf/tc/globals/connection_ids")
+        .context("connection_ids map not found")?;
+    let mut connection_ids = AyaHashMap::<MapData, u64, u32>::try_from(Map::HashMap(map_data))?;
+
+    connection_ids.remove(&pid_tgid)?;
 
     Ok(())
 }
