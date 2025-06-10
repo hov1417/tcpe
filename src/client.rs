@@ -1,32 +1,38 @@
 use mpdsr::{TcpeHandle, SERVER_IP};
-use std::io::{Read, Write};
-use std::net::Shutdown;
-use std::thread::sleep;
-use std::time::Duration;
+use std::io::Write;
+
+use bytecodec::bytes::BytesEncoder;
+use bytecodec::bytes::RemainingBytesDecoder;
+use bytecodec::io::IoDecodeExt;
+use bytecodec::io::IoEncodeExt;
+use bytecodec::Encode;
+use httpcodec::{BodyDecoder, HttpVersion, ResponseDecoder};
+use httpcodec::{BodyEncoder, Method, Request, RequestEncoder, RequestTarget};
 
 fn main() -> eyre::Result<()> {
-    let mut stream = TcpeHandle::connect((SERVER_IP, 8080).into())?;
+    let mut stream = bufstream::BufStream::new(TcpeHandle::connect((SERVER_IP, 8080).into())?);
     println!("Sending request");
-    stream.write_all(
-        b"Request first line based on which Server should decide the real server\n\
-              Data content which is only would be used in the real server\n",
-    )?;
-    sleep(Duration::from_millis(100));
 
-    stream.write_all(b"Data after some time\n")?;
+    let request = Request::new(
+        Method::new("GET")?,
+        RequestTarget::new("/foo")?,
+        HttpVersion::V1_1,
+        b"Data content which is only would be used in the real server",
+    );
 
-    sleep(Duration::from_millis(100));
-    stream.write_all(b"End of data\n")?;
+    let mut encoder = RequestEncoder::new(BodyEncoder::new(BytesEncoder::new()));
+    encoder.start_encoding(request)?;
 
-    sleep(Duration::from_millis(100));
-    stream.shutdown(Shutdown::Write)?;
-    
+    encoder.encode_all(&mut stream)?;
+    stream.flush()?;
+
     println!("Reading response");
 
-    let mut buf = Vec::new();
-    stream.read_to_end(&mut buf)?;
+    let mut decoder = ResponseDecoder::<BodyDecoder<RemainingBytesDecoder>>::default();
 
-    println!("{}", String::from_utf8_lossy(&buf));
+    let response = decoder.decode_exact(&mut stream)?;
+
+    println!("{response:?}");
 
     Ok(())
 }

@@ -21,6 +21,7 @@ use pnet_packet::ipv4::MutableIpv4Packet;
 use pnet_packet::tcp::{MutableTcpPacket, TcpFlags, TcpOption, TcpOptionNumber};
 use std::collections::{HashSet, VecDeque};
 use std::ffi::c_int;
+use std::fmt::Debug;
 use std::io::{Error, ErrorKind, Read, Write};
 use std::net::{IpAddr, Ipv4Addr, Shutdown, SocketAddr, SocketAddrV4, TcpListener, TcpStream};
 use std::ops::{Deref, DerefMut, Not};
@@ -220,7 +221,7 @@ impl Read for TcpStreamMoved {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         if self.data.is_empty() {
             if let Some(ch) = self.channel.take() {
-                match ch.recv() {
+                match ch.recv_timeout(Duration::from_secs(10)) {
                     Ok(d) => {
                         self.data.extend(&d);
                         self.read(buf)
@@ -271,7 +272,7 @@ impl TcpeStreamSubflow {
         }
     }
 
-    fn as_read(&mut self) -> Option<&mut impl Read> {
+    fn as_read(&mut self) -> Option<&mut (impl Read + Debug)> {
         match self {
             TcpeStreamSubflow::Tcp(_) => None,
             TcpeStreamSubflow::HandedOff(d) => Some(d),
@@ -301,7 +302,7 @@ pub struct TcpeStream {
     /// Remote paths in order of priority, first is highest
     connectable_remote_paths: VecDeque<(SocketAddr, u8)>,
     // TODO
-    local_paths: Vec<SocketAddr>,
+    // local_paths: Vec<SocketAddr>,
 }
 
 pub fn check(t: libc::c_int) -> io::Result<libc::c_int> {
@@ -344,16 +345,14 @@ impl TcpeStream {
         Ok(TcpeStream {
             connection_id,
             is_server: false,
-            local_paths: vec![initial_stream.local_addr()?],
+            // local_paths: vec![initial_stream.local_addr()?],
             connectable_remote_paths: vec![(remote_sock, 8)].into(),
-            streams: vec![
-                (TcpeStreamSubflow::Tcp(TcpStreamWithMeta {
-                    tcp: initial_stream,
-                    peer_addr: remote_sock,
-                    readable: true,
-                    writable: true,
-                })),
-            ],
+            streams: vec![TcpeStreamSubflow::Tcp(TcpStreamWithMeta {
+                tcp: initial_stream,
+                peer_addr: remote_sock,
+                readable: true,
+                writable: true,
+            })],
         })
     }
 
@@ -371,6 +370,7 @@ impl TcpeStream {
     }
 
     fn new_stream_unchecked(&mut self, remote_sock: SocketAddr) -> eyre::Result<()> {
+        println!("new stream");
         let pgid = get_pid_and_thread_group_id();
         store_connection_id(pgid, self.connection_id)?;
         let stream = TcpStream::connect(remote_sock)?;
@@ -389,7 +389,7 @@ impl TcpeStream {
         Ok(TcpeStream {
             connection_id,
             is_server,
-            local_paths: vec![tcp.local_addr()?],
+            // local_paths: vec![tcp.local_addr()?],
             connectable_remote_paths: VecDeque::new(),
             streams: vec![TcpeStreamSubflow::Tcp(TcpStreamWithMeta {
                 tcp,
@@ -407,7 +407,7 @@ impl TcpeStream {
         Ok(TcpeStream {
             connection_id: tcp.connection_id,
             is_server: true,
-            local_paths: vec![],
+            // local_paths: vec![],
             connectable_remote_paths: VecDeque::new(),
             streams: vec![TcpeStreamSubflow::HandedOff(TcpStreamMoved {
                 data: tcp.current_data.into(),
@@ -471,66 +471,6 @@ impl TcpeStream {
 
     pub fn remote_paths(&self) -> Vec<SocketAddr> {
         self.connectable_remote_paths.iter().map(|x| x.0).collect()
-    }
-
-    fn write_to_first_stream(&mut self, buf: &[u8]) -> io::Result<usize> {
-        let written = loop {
-            let writable = self
-                .streams
-                .iter_mut()
-                .filter(|s| s.writable())
-                .flat_map(|s| s.as_tcp_mut())
-                .next();
-
-            if writable.is_none() {
-                println!("Empty streams");
-                if self.connectable_remote_paths.is_empty() {
-                    break 0;
-                }
-
-                println!("trying new streams");
-                if !self
-                    .new_stream(self.connectable_remote_paths[0].0)
-                    .map_err(|e| {
-                        eprintln!("{e:?}");
-                        ErrorKind::BrokenPipe
-                    })?
-                {
-                    println!("unsuccessfully new streams");
-                    break 0;
-                }
-                continue;
-            }
-            let s = writable.unwrap();
-
-            println!("writing data to {:?}", s.peer_addr);
-            match s.write(buf) {
-                Ok(w) => {
-                    if w == 0 {
-                        s.writable = false;
-                        continue;
-                    }
-                    break w;
-                }
-                Err(e)
-                    if e.kind() == ErrorKind::BrokenPipe
-                        || e.kind() == ErrorKind::ConnectionReset =>
-                {
-                    eprintln!("Subflow is broken: {e:?}");
-                    // this stream is broken, trying a new one
-                    s.writable = false;
-                    s.readable = false;
-                    continue;
-                }
-                Err(e) => {
-                    eprintln!("Error writing {e:?}");
-                    return Err(e);
-                }
-            }
-        };
-
-        self.cleanup();
-        Ok(written)
     }
 
     fn cleanup(&mut self) {
@@ -673,26 +613,9 @@ fn ipv4(ip: IpAddr) -> Ipv4Addr {
     }
 }
 
-impl Write for TcpeStream {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.write_to_first_stream(buf)
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
-    }
-}
-
 #[derive(Clone, Debug)]
 pub struct TcpeHandle {
     inner: Arc<Mutex<TcpeStream>>,
-}
-
-impl TcpeHandle {
-    fn cleanup(&self) {
-        let mut inner = self.inner.lock().map_err(|_| eyre!("Poisoned")).unwrap();
-        inner.cleanup()
-    }
 }
 
 impl TcpeHandle {
@@ -746,6 +669,11 @@ impl TcpeHandle {
         &self,
         inner: &mut MutexGuard<TcpeStream>,
     ) -> eyre::Result<Vec<SocketAddr>> {
+        Self::check_path_changes(inner)?;
+        Ok(inner.remote_paths())
+    }
+
+    fn check_path_changes(inner: &mut MutexGuard<TcpeStream>) -> eyre::Result<()> {
         let addresses = inner
             .streams
             .iter()
@@ -755,7 +683,7 @@ impl TcpeHandle {
         for (l, p) in addresses {
             check_new_paths(inner, l, p)?
         }
-        Ok(inner.remote_paths())
+        Ok(())
     }
 
     pub fn connection_id(&self) -> u32 {
@@ -775,27 +703,89 @@ impl TcpeHandle {
             }));
         Ok(())
     }
+
+    fn write_to_first_stream(&self, buf: &[u8]) -> io::Result<usize> {
+        let written = loop {
+            let mut inner = self.inner.lock().map_err(|_| ErrorKind::BrokenPipe)?;
+            {
+                if inner.streams.is_empty() {
+                    return Ok(0);
+                }
+                let remotes = self
+                    .remote_paths_inner(&mut inner)
+                    .map_err(|e| Error::new(ErrorKind::Other, e))?;
+                if !remotes.is_empty() {
+                    if let Some(s) = inner.streams[0].as_tcp() {
+                        if s.peer_addr != remotes[0] {
+                            inner
+                                .new_stream_unchecked(remotes[0])
+                                .map_err(|e| Error::new(ErrorKind::Other, e))?;
+                        }
+                    }
+                }
+                inner.cleanup();
+            }
+
+            let writable = inner
+                .streams
+                .iter_mut()
+                .filter(|s| s.writable())
+                .flat_map(|s| s.as_tcp_mut())
+                .next();
+
+            if writable.is_none() {
+                println!("Empty streams");
+                if inner.connectable_remote_paths.is_empty() {
+                    break 0;
+                }
+
+                println!("trying new streams");
+                let first_remote_path = inner.connectable_remote_paths[0].0;
+                if !inner.new_stream(first_remote_path).map_err(|e| {
+                    eprintln!("{e:?}");
+                    ErrorKind::BrokenPipe
+                })? {
+                    println!("unsuccessfully new streams");
+                    break 0;
+                }
+                continue;
+            }
+            let s = writable.unwrap();
+
+            println!("writing data to {:?}", s.peer_addr);
+            match s.write(buf) {
+                Ok(w) => {
+                    if w == 0 {
+                        s.writable = false;
+                        continue;
+                    }
+                    break w;
+                }
+                Err(e)
+                    if e.kind() == ErrorKind::BrokenPipe
+                        || e.kind() == ErrorKind::ConnectionReset =>
+                {
+                    eprintln!("Subflow is broken: {e:?}");
+                    // this stream is broken, trying a new one
+                    s.writable = false;
+                    s.readable = false;
+                    continue;
+                }
+                Err(e) => {
+                    eprintln!("Error writing {e:?}");
+                    return Err(e);
+                }
+            }
+        };
+
+        // self.cleanup();
+        Ok(written)
+    }
 }
 
 impl Write for TcpeHandle {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        let mut inner = self.inner.lock().map_err(|_| ErrorKind::BrokenPipe)?;
-        if inner.streams.is_empty() {
-            return Ok(0);
-        }
-        let remotes = self
-            .remote_paths_inner(&mut inner)
-            .map_err(|e| Error::new(ErrorKind::Other, e))?;
-        if !remotes.is_empty() {
-            if let Some(s) = inner.streams[0].as_tcp() {
-                if s.peer_addr != remotes[0] {
-                    inner
-                        .new_stream_unchecked(remotes[0])
-                        .map_err(|e| Error::new(ErrorKind::Other, e))?;
-                }
-            }
-        }
-        inner.write(buf)
+        self.write_to_first_stream(buf)
     }
 
     fn flush(&mut self) -> io::Result<()> {
@@ -807,6 +797,25 @@ impl Read for TcpeHandle {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         let read = 'overall: loop {
             let mut tcpe_stream = self.inner.lock().map_err(|_| ErrorKind::BrokenPipe)?;
+            {
+                if tcpe_stream.streams.is_empty() {
+                    return Ok(0);
+                }
+                let remotes = self
+                    .remote_paths_inner(&mut tcpe_stream)
+                    .map_err(|e| Error::new(ErrorKind::Other, e))?;
+                if !remotes.is_empty() {
+                    if let Some(s) = tcpe_stream.streams[0].as_tcp() {
+                        if s.peer_addr != remotes[0] {
+                            tcpe_stream
+                                .new_stream_unchecked(remotes[0])
+                                .map_err(|e| Error::new(ErrorKind::Other, e))?;
+                        }
+                    }
+                }
+                tcpe_stream.cleanup();
+            }
+
             let existing_data = tcpe_stream
                 .streams
                 .iter_mut()
@@ -823,7 +832,7 @@ impl Read for TcpeHandle {
                 .collect::<Vec<_>>();
 
             if readables.is_empty() {
-                println!("Empty streams");
+                println!("Empty streams closing");
                 if tcpe_stream.connectable_remote_paths.is_empty() {
                     break 'overall 0;
                 }
@@ -834,7 +843,7 @@ impl Read for TcpeHandle {
                     eprintln!("{e:?}");
                     ErrorKind::BrokenPipe
                 })? {
-                    println!("unsuccessfully new streams");
+                    println!("unsuccessful new streams");
                     break 'overall 0;
                 }
                 continue 'overall;
@@ -850,14 +859,10 @@ impl Read for TcpeHandle {
                 })
                 .collect();
 
-            println!("waiting for a data");
-
-            let timeout: PollTimeout = Duration::from_millis(10).try_into().unwrap();
-            poll(&mut poll_fds, timeout).map_err(|e| {
+            let timeout: PollTimeout = Duration::from_millis(1000).try_into().unwrap();
+            poll(&mut poll_fds, timeout).inspect_err(|e| {
                 eprintln!("Error while polling {e:?}");
-                e
             })?;
-            println!("Poll emitted event");
 
             for (i, pfd) in poll_fds.iter().enumerate() {
                 let flags = pfd.revents().unwrap_or(PollFlags::empty());
@@ -886,13 +891,12 @@ impl Read for TcpeHandle {
                     let peer_addr = readables[i].peer_addr;
                     check_new_paths(&mut tcpe_stream, local_addr, peer_addr)?;
                     break 'overall n;
-                } else {
+                } else if !flags.is_empty() {
                     println!("Other event {:?}", flags);
                 }
             }
+            tcpe_stream.cleanup();
         };
-
-        self.cleanup();
 
         Ok(read)
     }
@@ -978,7 +982,7 @@ impl TcpeServer {
         match self.connections.entry(connection_id) {
             Entry::Occupied(mut state) => {
                 state.get_mut().add_stream(stream)?;
-                self.accept()
+                Ok(state.get().clone())
             }
             Entry::Vacant(v) => {
                 let stream = TcpeStream::from_stream(stream, connection_id, true)?;

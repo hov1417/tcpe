@@ -15,7 +15,7 @@
 #ifdef DEBUG_CODE
 #define bpf_print(fmt, ...)                                                   \
     do {                                                                      \
-        static const char _fmt[] = PREFIX fmt;                                       \
+        static const char _fmt[] = PREFIX fmt;                                \
         bpf_trace_printk(_fmt, sizeof(_fmt), ##__VA_ARGS__);                  \
     } while (0)
 #else

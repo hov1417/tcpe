@@ -1,15 +1,24 @@
 use mpdsr::SERVER_IP;
 use mpdsr::SERVER_PORT2;
 use mpdsr::{TcpeHandle, TcpeServer};
-use std::io::{Read, Write};
+use std::io::{BufReader, Write};
 use std::net::Shutdown;
 use std::sync::Arc;
 use std::time::Duration;
 
+use bytecodec::bytes::{BytesEncoder, RemainingBytesDecoder};
+use bytecodec::io::{IoDecodeExt, IoEncodeExt};
+use bytecodec::Encode;
 use eyre::{Context, Report};
+use httpcodec::BodyDecoder;
+use httpcodec::BodyEncoder;
+use httpcodec::HttpVersion;
+use httpcodec::ReasonPhrase;
+use httpcodec::RequestDecoder;
+use httpcodec::ResponseEncoder;
 use mpdsr::handoff::{TcpeHandoffEnd, TcpeHandoffStart};
 use oxhttp::model::header::CONTENT_TYPE;
-use oxhttp::model::{Body, Method, Request, Response, StatusCode};
+use oxhttp::model::{Body, Method, Request, Response};
 use oxhttp::Server;
 use serde_json::json;
 use std::net::Ipv4Addr;
@@ -63,7 +72,7 @@ fn handle_handoff(
         let handoff: TcpeHandoffStart =
             serde_json::from_reader(request.body_mut()).context("Invalid body")?;
         println!(
-            "connection {}, data {}",
+            "connection {}, data {:?}",
             handoff.connection_id,
             String::from_utf8_lossy(&handoff.current_data)
         );
@@ -74,7 +83,7 @@ fn handle_handoff(
         let handoff: TcpeHandoffEnd =
             serde_json::from_reader(request.body_mut()).context("Invalid body")?;
         println!(
-            "connection {}, data {}",
+            "connection {}, data {:?}",
             handoff.connection_id,
             String::from_utf8_lossy(&handoff.left_over_data)
         );
@@ -82,7 +91,7 @@ fn handle_handoff(
         empty_response()
     } else {
         Response::builder()
-            .status(StatusCode::NOT_FOUND)
+            .status(oxhttp::model::StatusCode::NOT_FOUND)
             .body(Body::empty())
             .context("Error creating body")
     }
@@ -94,12 +103,24 @@ fn empty_response() -> Result<Response<Body>, Report> {
         .context("Error creating body")
 }
 
-fn handle(mut stream: TcpeHandle) -> eyre::Result<()> {
-    let mut buf = Vec::new();
-    stream.read_to_end(&mut buf)?;
-    println!("{}", String::from_utf8_lossy(&buf));
+fn handle(stream: TcpeHandle) -> eyre::Result<()> {
+    let mut decoder = RequestDecoder::<BodyDecoder<RemainingBytesDecoder>>::default();
+    let mut stream = BufReader::new(stream);
+    let req = decoder.decode_exact(&mut stream)?;
+    println!("request {:?}", req);
+    let request = httpcodec::Response::new(
+        HttpVersion::V1_1,
+        httpcodec::StatusCode::new(200)?,
+        ReasonPhrase::new("OK")?,
+        b"Reponse body",
+    );
 
-    stream.write_all(b"hello\n")?;
+    let mut encoder = ResponseEncoder::new(BodyEncoder::new(BytesEncoder::new()));
+    encoder.start_encoding(request)?;
+
+    let mut stream = stream.into_inner();
+    encoder.encode_all(&mut stream)?;
+    stream.flush()?;
 
     sleep(Duration::from_millis(100));
     println!("Closing connection");

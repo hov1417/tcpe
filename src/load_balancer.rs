@@ -1,4 +1,6 @@
+use bytecodec::{ByteCount, Decode, Eos};
 use eyre::ensure;
+use httpcodec::{NoBodyDecoder, RequestDecoder};
 use mpdsr::handoff::{TcpeHandoffEnd, TcpeHandoffStart};
 use mpdsr::raw_tcp_socket;
 use mpdsr::TcpeHandle;
@@ -12,9 +14,9 @@ use pnet::transport::TransportSender;
 use std::io::{BufReader, Read};
 use std::net::Shutdown;
 use std::sync::{Arc, Mutex};
-use std::thread;
 use std::thread::sleep;
 use std::time::Duration;
+use std::{cmp, thread};
 
 fn main() -> eyre::Result<()> {
     let raw_send = raw_tcp_socket()?;
@@ -31,18 +33,44 @@ fn main() -> eyre::Result<()> {
     }
 }
 
-fn handle(mut stream: TcpeHandle, send: Arc<Mutex<TransportSender>>) -> eyre::Result<()> {
-    let mut buf = vec![0; 50];
-    let mut read = BufReader::new(stream.clone());
-    read.read_exact(&mut buf)?;
-    println!("{}", String::from_utf8_lossy(&buf));
+fn handle(stream: TcpeHandle, send: Arc<Mutex<TransportSender>>) -> eyre::Result<()> {
+    println!("handling");
+    let mut stream = BufReader::new(stream);
+    let mut decoder = RequestDecoder::<NoBodyDecoder>::default();
+    let mut head = Vec::new();
+    let mut buf = [0; 1024];
+    let item = loop {
+        let mut size = match decoder.requiring_bytes() {
+            ByteCount::Finite(n) => cmp::min(n, buf.len() as u64) as usize,
+            ByteCount::Infinite => buf.len(),
+            ByteCount::Unknown => 1,
+        };
+        println!("required bytes {size:?}");
+        let eos = if size != 0 {
+            size = stream.read(&mut buf[..size])?;
+            Eos::new(size == 0)
+        } else {
+            Eos::new(false)
+        };
+        // decoder.omit()
+
+        let consumed = decoder.decode(&buf[..size], eos)?;
+        head.extend_from_slice(&buf[..consumed]);
+        if decoder.is_idle() {
+            let item = decoder.finish_decoding()?;
+            break item;
+        }
+    };
+    println!("{item:?}");
     // TODO decision here
 
     println!("starting handoff to server");
+    head.extend_from_slice(stream.buffer());
+    println!("{:?}", String::from_utf8_lossy(&head));
+    let mut stream = stream.into_inner();
     let connection_id = stream.connection_id();
-    buf.extend_from_slice(read.buffer());
-    handoff_start(connection_id, buf)?;
-    
+    handoff_start(connection_id, head)?;
+
     println!("advertise server path");
     stream.advertise((SERVER_IP, SERVER_PORT2).into(), 9, send.clone())?;
     println!("removing lb path");
@@ -51,13 +79,16 @@ fn handle(mut stream: TcpeHandle, send: Arc<Mutex<TransportSender>>) -> eyre::Re
     println!("ending handoff to server");
     let mut buf = Vec::new();
     stream.read_to_end(&mut buf)?;
-    handoff_end(connection_id, buf)?;
 
-    // TODO write direction backward compatibility code here
+    if let Err(e) = handoff_end(connection_id, buf) {
+        eprintln!("Error handing off, continuing as a pass through load balancer: {e:?}");
+        // TODO
+    } else {
+        println!("closing connection");
+        sleep(Duration::from_millis(100));
+        stream.shutdown(Shutdown::Both)?;
+    }
 
-    println!("closing connection");
-    sleep(Duration::from_millis(100));
-    stream.shutdown(Shutdown::Both)?;
     Ok(())
 }
 
