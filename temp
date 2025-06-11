@@ -1,6 +1,0 @@
-TODO
-- there is a layer 4 load balancer alongside the layer 7 (in same application, using raw sockets)
-- if connection is lost, and server doesn't receive new connection after notified connection handoff (with some timeout),
- and client continues sending data to LB IP, client continues using write direction as well through LB, in other words it falls back to classic layer 7 LB
-- If handoff start or handoff end fails (both are send and recv) LB selects another RS
-- Recheck 6.2.4 Load balancer handoff protocol, error handling

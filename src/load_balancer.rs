@@ -2,26 +2,25 @@ use bytecodec::{ByteCount, Decode, Eos};
 use eyre::ensure;
 use httpcodec::{NoBodyDecoder, RequestDecoder};
 use mpdsr::handoff::{TcpeHandoffEnd, TcpeHandoffStart};
-use mpdsr::raw_tcp_socket;
-use mpdsr::TcpeHandle;
-use mpdsr::TcpeServer;
+use mpdsr::{TcpeServer, HANDOFF_PORT2};
+use mpdsr::LB_PORT;
 use mpdsr::SERVER_IP;
-use mpdsr::SERVER_PORT;
 use mpdsr::SERVER_PORT2;
+use mpdsr::{raw_tcp_socket, SERVER_PORT1};
+use mpdsr::{TcpeHandle, HANDOFF_PORT1};
 use oxhttp::model::{Body, Method, Request, StatusCode};
 use oxhttp::Client;
 use pnet::transport::TransportSender;
-use std::io::{BufReader, Read};
-use std::net::Shutdown;
+use rand::random;
+use std::io::{BufReader, Read, Write};
+use std::net::{Shutdown, SocketAddr, SocketAddrV4, TcpStream};
 use std::sync::{Arc, Mutex};
-use std::thread::sleep;
-use std::time::Duration;
-use std::{cmp, thread};
+use std::{cmp, io, thread};
 
 fn main() -> eyre::Result<()> {
     let raw_send = raw_tcp_socket()?;
     let raw_send = Arc::new(Mutex::new(raw_send));
-    let listen = TcpeServer::bind((SERVER_IP, SERVER_PORT).into())?;
+    let listen = TcpeServer::bind((SERVER_IP, LB_PORT).into())?;
     loop {
         let stream = listen.accept()?;
         let raw_send = raw_send.clone();
@@ -32,6 +31,22 @@ fn main() -> eyre::Result<()> {
         });
     }
 }
+
+#[derive(Debug, Clone, Copy)]
+struct Server {
+    addr: SocketAddr,
+    handoff_addr: SocketAddr,
+}
+const SERVERS: [Server; 2] = [
+    Server {
+        addr: SocketAddr::V4(SocketAddrV4::new(SERVER_IP, SERVER_PORT1)),
+        handoff_addr: SocketAddr::V4(SocketAddrV4::new(SERVER_IP, HANDOFF_PORT1)),
+    },
+    Server {
+        addr: SocketAddr::V4(SocketAddrV4::new(SERVER_IP, SERVER_PORT2)),
+        handoff_addr: SocketAddr::V4(SocketAddrV4::new(SERVER_IP, HANDOFF_PORT2)),
+    },
+];
 
 fn handle(stream: TcpeHandle, send: Arc<Mutex<TransportSender>>) -> eyre::Result<()> {
     println!("handling");
@@ -52,7 +67,6 @@ fn handle(stream: TcpeHandle, send: Arc<Mutex<TransportSender>>) -> eyre::Result
         } else {
             Eos::new(false)
         };
-        // decoder.omit()
 
         let consumed = decoder.decode(&buf[..size], eos)?;
         head.extend_from_slice(&buf[..consumed]);
@@ -62,45 +76,56 @@ fn handle(stream: TcpeHandle, send: Arc<Mutex<TransportSender>>) -> eyre::Result
         }
     };
     println!("{item:?}");
-    // TODO decision here
-
-    println!("starting handoff to server");
     head.extend_from_slice(stream.buffer());
     println!("{:?}", String::from_utf8_lossy(&head));
-    let mut stream = stream.into_inner();
-    let connection_id = stream.connection_id();
-    handoff_start(connection_id, head)?;
+    let mut client_stream = stream.into_inner();
+    let connection_id = client_stream.connection_id();
+    let server = loop {
+        let i = random::<u8>() % SERVERS.len() as u8;
+        let server = SERVERS[i as usize];
+        println!("starting handoff to server {server:?}");
+        if let Err(e) = handoff_start(server.handoff_addr, connection_id, &head) {
+            eprintln!(
+                "Error while handing off start, continuing as a pass through load balancer: {e:?}"
+            );
+            continue;
+        }
+        break server;
+    };
 
     println!("advertise server path");
-    stream.advertise((SERVER_IP, SERVER_PORT2).into(), 9, send.clone())?;
+    client_stream.advertise(server.addr, 9, send.clone())?;
     println!("removing lb path");
-    stream.close_path((SERVER_IP, SERVER_PORT).into(), send.clone())?;
+    client_stream.close_path((SERVER_IP, LB_PORT).into(), send.clone())?;
 
     println!("ending handoff to server");
     let mut buf = Vec::new();
-    stream.read_to_end(&mut buf)?;
+    client_stream.read_to_end(&mut buf)?;
 
-    if let Err(e) = handoff_end(connection_id, buf) {
+    if let Err(e) = handoff_end(server.handoff_addr, connection_id, &buf) {
         eprintln!("Error handing off, continuing as a pass through load balancer: {e:?}");
-        // TODO
+        let mut server_con = TcpStream::connect(server.addr)?;
+        server_con.write_all(&head)?;
+        server_con.write_all(&buf)?;
+        io::copy(&mut server_con, &mut client_stream)?;
     } else {
         println!("closing connection");
-        sleep(Duration::from_millis(100));
-        stream.shutdown(Shutdown::Both)?;
     }
+    client_stream.shutdown(Shutdown::Both)?;
 
     Ok(())
 }
 
-fn handoff_start(connection_id: u32, current_data: Vec<u8>) -> eyre::Result<()> {
+fn handoff_start(server: SocketAddr, connection_id: u32, current_data: &[u8]) -> eyre::Result<()> {
     let client = Client::new();
+    let server_url = format!("http://{server}");
     let response = client.request(
         Request::builder()
-            .uri("http://localhost:9090/handoff-start")
+            .uri(format!("{server_url}/handoff-start"))
             .method(Method::POST)
             .body(Body::from(serde_json::to_vec(&TcpeHandoffStart {
                 connection_id,
-                current_data,
+                current_data: current_data.to_owned(),
             })?))?,
     )?;
     ensure!(response.status() == StatusCode::OK);
@@ -108,15 +133,16 @@ fn handoff_start(connection_id: u32, current_data: Vec<u8>) -> eyre::Result<()> 
     Ok(())
 }
 
-fn handoff_end(connection_id: u32, left_over_data: Vec<u8>) -> eyre::Result<()> {
+fn handoff_end(server: SocketAddr, connection_id: u32, left_over_data: &[u8]) -> eyre::Result<()> {
     let client = Client::new();
+    let server_url = format!("http://{server}");
     let response = client.request(
         Request::builder()
-            .uri("http://localhost:9090/handoff-end")
+            .uri(format!("{server_url}/handoff-start"))
             .method(Method::POST)
             .body(Body::from(serde_json::to_vec(&TcpeHandoffEnd {
                 connection_id,
-                left_over_data,
+                left_over_data: left_over_data.to_owned(),
             })?))?,
     )?;
     ensure!(response.status() == StatusCode::OK);

@@ -13,5 +13,6 @@ pub struct TcpeHandoffStart {
 #[serde(rename_all="camelCase")]
 pub struct TcpeHandoffEnd {
     pub connection_id: u32,
+    #[serde(with = "base64_bytes")]
     pub left_over_data: Vec<u8>,
 }

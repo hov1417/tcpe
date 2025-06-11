@@ -31,9 +31,12 @@ use std::sync::{mpsc, Arc, LazyLock, Mutex, MutexGuard};
 use std::time::Duration;
 use std::{io, thread};
 
-pub const SERVER_IP: IpAddr = IpAddr::V4(Ipv4Addr::new(192, 168, 2, 79));
-pub const SERVER_PORT: u16 = 8080;
-pub const SERVER_PORT2: u16 = 8081;
+pub const SERVER_IP: Ipv4Addr = Ipv4Addr::new(192, 168, 2, 79);
+pub const LB_PORT: u16 = 8080;
+pub const SERVER_PORT1: u16 = 8081;
+pub const SERVER_PORT2: u16 = 8082;
+pub const HANDOFF_PORT1: u16 = 9091;
+pub const HANDOFF_PORT2: u16 = 9092;
 
 pub fn get_connection_id(
     client_sock: SocketAddr,
@@ -301,8 +304,6 @@ pub struct TcpeStream {
     streams: Vec<TcpeStreamSubflow>,
     /// Remote paths in order of priority, first is highest
     connectable_remote_paths: VecDeque<(SocketAddr, u8)>,
-    // TODO
-    // local_paths: Vec<SocketAddr>,
 }
 
 pub fn check(t: libc::c_int) -> io::Result<libc::c_int> {
@@ -913,7 +914,6 @@ impl Read for TcpeHandle {
     }
 }
 
-// TODO: error handling
 fn accept_first(sockets: &[TcpListener]) -> io::Result<TcpStream> {
     let mut poll_fds: Vec<PollFd> = sockets
         .iter()
@@ -1025,6 +1025,9 @@ pub fn raw_tcp_socket() -> eyre::Result<TransportSender> {
 
     thread::spawn(move || {
         let mut rx = rx;
+        let ports: HashSet<_> = vec![LB_PORT, SERVER_PORT1, SERVER_PORT2]
+            .into_iter()
+            .collect();
         loop {
             let frame = rx.next().unwrap();
             let Some(eth) = EthernetPacket::new(frame) else {
@@ -1042,10 +1045,8 @@ pub fn raw_tcp_socket() -> eyre::Result<TransportSender> {
             let Some(tcp_packet) = TcpPacket::new(packet.payload()) else {
                 continue;
             };
-            if tcp_packet.get_source() == SERVER_PORT
-                || tcp_packet.get_source() == SERVER_PORT2
-                || tcp_packet.get_destination() == SERVER_PORT
-                || tcp_packet.get_destination() == SERVER_PORT2
+            if ports.contains(&tcp_packet.get_source())
+                || ports.contains(&tcp_packet.get_destination())
             {
                 SEQ_NUMS
                     .entry((

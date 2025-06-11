@@ -1,5 +1,5 @@
+use std::env::args;
 use mpdsr::SERVER_IP;
-use mpdsr::SERVER_PORT2;
 use mpdsr::{TcpeHandle, TcpeServer};
 use std::io::{BufReader, Write};
 use std::net::Shutdown;
@@ -26,8 +26,11 @@ use std::thread;
 use std::thread::sleep;
 
 fn main() -> eyre::Result<()> {
-    let server = Arc::new(TcpeServer::bind((SERVER_IP, SERVER_PORT2).into())?);
-    spawn_handoff_communicator(server.clone())?;
+    let arguments = args().collect::<Vec<String>>();
+    let server_port = arguments[1].parse::<u16>()?;
+    let handoff_port = arguments[2].parse::<u16>()?;
+    let server = Arc::new(TcpeServer::bind((SERVER_IP, server_port).into())?);
+    spawn_handoff_communicator(server.clone(), handoff_port)?;
 
     loop {
         let stream = match server.accept() {
@@ -45,7 +48,7 @@ fn main() -> eyre::Result<()> {
     }
 }
 
-fn spawn_handoff_communicator(server: Arc<TcpeServer>) -> eyre::Result<()> {
+fn spawn_handoff_communicator(server: Arc<TcpeServer>, handoff_port: u16) -> eyre::Result<()> {
     Server::new(move |request| {
         handle_handoff(request, &server).unwrap_or_else(|e| {
             println!("Error: {e:?}");
@@ -55,7 +58,7 @@ fn spawn_handoff_communicator(server: Arc<TcpeServer>) -> eyre::Result<()> {
                 .unwrap()
         })
     })
-    .bind((Ipv4Addr::LOCALHOST, 9090))
+    .bind((Ipv4Addr::LOCALHOST, handoff_port))
     .with_global_timeout(Duration::from_secs(10))
     .with_max_concurrent_connections(128)
     .spawn()
