@@ -371,7 +371,7 @@ impl TcpeStream {
     }
 
     fn new_stream_unchecked(&mut self, remote_sock: SocketAddr) -> eyre::Result<()> {
-        println!("new stream");
+        println!("new stream to {remote_sock:?}");
         let pgid = get_pid_and_thread_group_id();
         store_connection_id(pgid, self.connection_id)?;
         let stream = TcpStream::connect(remote_sock)?;
@@ -849,7 +849,7 @@ impl Read for TcpeHandle {
                     break 'overall 0;
                 }
 
-                println!("trying new streams");
+                println!("trying new streams from {:?}", tcpe_stream.connectable_remote_paths);
                 let addr = tcpe_stream.connectable_remote_paths[0].0;
                 if !tcpe_stream.new_stream(addr).map_err(|e| {
                     eprintln!("{e:?}");

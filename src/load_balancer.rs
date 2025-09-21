@@ -2,12 +2,12 @@ use bytecodec::{ByteCount, Decode, Eos};
 use eyre::ensure;
 use httpcodec::{NoBodyDecoder, RequestDecoder};
 use mpdsr::handoff::{TcpeHandoffEnd, TcpeHandoffStart};
-use mpdsr::{TcpeServer, HANDOFF_PORT2};
 use mpdsr::LB_PORT;
 use mpdsr::SERVER_IP;
 use mpdsr::SERVER_PORT2;
 use mpdsr::{raw_tcp_socket, SERVER_PORT1};
 use mpdsr::{TcpeHandle, HANDOFF_PORT1};
+use mpdsr::{TcpeServer, HANDOFF_PORT2};
 use oxhttp::model::{Body, Method, Request, StatusCode};
 use oxhttp::Client;
 use pnet::transport::TransportSender;
@@ -22,7 +22,13 @@ fn main() -> eyre::Result<()> {
     let raw_send = Arc::new(Mutex::new(raw_send));
     let listen = TcpeServer::bind((SERVER_IP, LB_PORT).into())?;
     loop {
-        let stream = listen.accept()?;
+        let stream = match listen.accept() {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("{e:?}");
+                continue
+            },
+        };
         let raw_send = raw_send.clone();
         thread::spawn(move || {
             if let Err(e) = handle(stream, raw_send) {
@@ -138,7 +144,7 @@ fn handoff_end(server: SocketAddr, connection_id: u32, left_over_data: &[u8]) ->
     let server_url = format!("http://{server}");
     let response = client.request(
         Request::builder()
-            .uri(format!("{server_url}/handoff-start"))
+            .uri(format!("{server_url}/handoff-end"))
             .method(Method::POST)
             .body(Body::from(serde_json::to_vec(&TcpeHandoffEnd {
                 connection_id,
