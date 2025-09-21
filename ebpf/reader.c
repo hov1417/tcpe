@@ -279,11 +279,10 @@ int reader_ingress_func(struct __sk_buff* skb)
     if (tcp->fin || tcp->rst)
     {
         const struct ipv4_key key = get_key(iph, tcp);
-        if (bpf_map_delete_elem(tcpe_conn_map, &key) != 0)
+        if (bpf_map_delete_elem(&tcpe_conn_map, &key) != 0)
         {
             bpf_print("error deleting connection id from tcpe_conn_map");
         }
-        if ()
     }
 
     __u8 opts[40];

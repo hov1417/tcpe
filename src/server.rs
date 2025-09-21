@@ -21,7 +21,6 @@ use oxhttp::model::header::CONTENT_TYPE;
 use oxhttp::model::{Body, Method, Request, Response};
 use oxhttp::Server;
 use serde_json::json;
-use std::net::Ipv4Addr;
 use std::thread;
 use std::thread::sleep;
 
@@ -58,7 +57,7 @@ fn spawn_handoff_communicator(server: Arc<TcpeServer>, handoff_port: u16) -> eyr
                 .unwrap()
         })
     })
-    .bind((Ipv4Addr::LOCALHOST, handoff_port))
+    .bind((SERVER_IP, handoff_port))
     .with_global_timeout(Duration::from_secs(10))
     .with_max_concurrent_connections(128)
     .spawn()
