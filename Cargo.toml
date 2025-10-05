@@ -29,7 +29,6 @@ pnet_packet = "0.35.0"
 serde = { version = "1.0.219", features = ["derive"] }
 base64 = "0.22.1"
 rand = "0.9.1"
-bincode = "2.0.1"
 bytecodec = "0.4.0"
 httpcodec = "0.2.3"
 bufstream = "0.1.4"

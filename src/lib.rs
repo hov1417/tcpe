@@ -371,7 +371,6 @@ impl TcpeStream {
     }
 
     fn new_stream_unchecked(&mut self, remote_sock: SocketAddr) -> eyre::Result<()> {
-        println!("new stream to {remote_sock:?}");
         let pgid = get_pid_and_thread_group_id();
         store_connection_id(pgid, self.connection_id)?;
         let stream = TcpStream::connect(remote_sock)?;
@@ -746,25 +745,21 @@ impl TcpeHandle {
                 .next();
 
             if writable.is_none() {
-                println!("Empty streams");
                 if inner.connectable_remote_paths.is_empty() {
                     break 0;
                 }
 
-                println!("trying new streams");
                 let first_remote_path = inner.connectable_remote_paths[0].0;
                 if !inner.new_stream(first_remote_path).map_err(|e| {
                     eprintln!("{e:?}");
                     ErrorKind::BrokenPipe
                 })? {
-                    println!("unsuccessfully new streams");
                     break 0;
                 }
                 continue;
             }
             let s = writable.unwrap();
 
-            println!("writing data to {:?}", s.peer_addr);
             match s.write(buf) {
                 Ok(w) => {
                     if w == 0 {
@@ -790,7 +785,6 @@ impl TcpeHandle {
             }
         };
 
-        // self.cleanup();
         Ok(written)
     }
 }
@@ -844,18 +838,15 @@ impl Read for TcpeHandle {
                 .collect::<Vec<_>>();
 
             if readables.is_empty() {
-                println!("Empty streams closing");
                 if tcpe_stream.connectable_remote_paths.is_empty() {
                     break 'overall 0;
                 }
 
-                println!("trying new streams from {:?}", tcpe_stream.connectable_remote_paths);
                 let addr = tcpe_stream.connectable_remote_paths[0].0;
                 if !tcpe_stream.new_stream(addr).map_err(|e| {
                     eprintln!("{e:?}");
                     ErrorKind::BrokenPipe
                 })? {
-                    println!("unsuccessful new streams");
                     break 'overall 0;
                 }
                 continue 'overall;
@@ -886,7 +877,7 @@ impl Read for TcpeHandle {
                             if e.kind() == ErrorKind::BrokenPipe
                                 || e.kind() == ErrorKind::ConnectionReset =>
                         {
-                            println!("Error after stream polled, retrying");
+                            eprintln!("Error after stream polled, retrying");
                             continue 'overall;
                         }
                         Err(e) => {

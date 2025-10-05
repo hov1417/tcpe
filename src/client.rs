@@ -11,7 +11,6 @@ use httpcodec::{BodyEncoder, Method, Request, RequestEncoder, RequestTarget};
 
 fn main() -> eyre::Result<()> {
     let mut stream = bufstream::BufStream::new(TcpeHandle::connect((SERVER_IP, 8080).into())?);
-    println!("Sending request");
 
     let request = Request::new(
         Method::new("GET")?,
@@ -25,8 +24,6 @@ fn main() -> eyre::Result<()> {
 
     encoder.encode_all(&mut stream)?;
     stream.flush()?;
-
-    println!("Reading response");
 
     let mut decoder = ResponseDecoder::<BodyDecoder<RemainingBytesDecoder>>::default();
 

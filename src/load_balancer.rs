@@ -32,7 +32,7 @@ fn main() -> eyre::Result<()> {
         let raw_send = raw_send.clone();
         thread::spawn(move || {
             if let Err(e) = handle(stream, raw_send) {
-                println!("Error: {e:?}");
+                eprintln!("Error: {e:?}");
             }
         });
     }
@@ -55,18 +55,16 @@ const SERVERS: [Server; 2] = [
 ];
 
 fn handle(stream: TcpeHandle, send: Arc<Mutex<TransportSender>>) -> eyre::Result<()> {
-    println!("handling");
     let mut stream = BufReader::new(stream);
     let mut decoder = RequestDecoder::<NoBodyDecoder>::default();
     let mut head = Vec::new();
     let mut buf = [0; 1024];
-    let item = loop {
+    loop {
         let mut size = match decoder.requiring_bytes() {
             ByteCount::Finite(n) => cmp::min(n, buf.len() as u64) as usize,
             ByteCount::Infinite => buf.len(),
             ByteCount::Unknown => 1,
         };
-        println!("required bytes {size:?}");
         let eos = if size != 0 {
             size = stream.read(&mut buf[..size])?;
             Eos::new(size == 0)
@@ -81,15 +79,12 @@ fn handle(stream: TcpeHandle, send: Arc<Mutex<TransportSender>>) -> eyre::Result
             break item;
         }
     };
-    println!("{item:?}");
     head.extend_from_slice(stream.buffer());
-    println!("{:?}", String::from_utf8_lossy(&head));
     let mut client_stream = stream.into_inner();
     let connection_id = client_stream.connection_id();
     let server = loop {
         let i = random::<u8>() % SERVERS.len() as u8;
         let server = SERVERS[i as usize];
-        println!("starting handoff to server {server:?}");
         if let Err(e) = handoff_start(server.handoff_addr, connection_id, &head) {
             eprintln!(
                 "Error while handing off start, continuing as a pass through load balancer: {e:?}"
@@ -99,12 +94,9 @@ fn handle(stream: TcpeHandle, send: Arc<Mutex<TransportSender>>) -> eyre::Result
         break server;
     };
 
-    println!("advertise server path");
     client_stream.advertise(server.addr, 9, send.clone())?;
-    println!("removing lb path");
     client_stream.close_path((SERVER_IP, LB_PORT).into(), send.clone())?;
 
-    println!("ending handoff to server");
     let mut buf = Vec::new();
     client_stream.read_to_end(&mut buf)?;
 
@@ -114,8 +106,6 @@ fn handle(stream: TcpeHandle, send: Arc<Mutex<TransportSender>>) -> eyre::Result
         server_con.write_all(&head)?;
         server_con.write_all(&buf)?;
         io::copy(&mut server_con, &mut client_stream)?;
-    } else {
-        println!("closing connection");
     }
     client_stream.shutdown(Shutdown::Both)?;
 

@@ -1,20 +1,18 @@
-use std::env::args;
 use mpdsr::SERVER_IP;
 use mpdsr::{TcpeHandle, TcpeServer};
+use std::env::args;
 use std::io::{BufReader, Write};
 use std::net::Shutdown;
 use std::sync::Arc;
 use std::time::Duration;
 
-use bytecodec::bytes::{BytesEncoder, RemainingBytesDecoder};
-use bytecodec::io::{IoDecodeExt, IoEncodeExt};
+use bytecodec::bytes::BytesEncoder;
+use bytecodec::io::IoEncodeExt;
 use bytecodec::Encode;
 use eyre::{Context, Report};
-use httpcodec::BodyDecoder;
 use httpcodec::BodyEncoder;
 use httpcodec::HttpVersion;
 use httpcodec::ReasonPhrase;
-use httpcodec::RequestDecoder;
 use httpcodec::ResponseEncoder;
 use mpdsr::handoff::{TcpeHandoffEnd, TcpeHandoffStart};
 use oxhttp::model::header::CONTENT_TYPE;
@@ -22,7 +20,6 @@ use oxhttp::model::{Body, Method, Request, Response};
 use oxhttp::Server;
 use serde_json::json;
 use std::thread;
-use std::thread::sleep;
 
 fn main() -> eyre::Result<()> {
     let arguments = args().collect::<Vec<String>>();
@@ -41,7 +38,7 @@ fn main() -> eyre::Result<()> {
         };
         thread::spawn(move || {
             if let Err(e) = handle(stream) {
-                println!("Error: {e:?}");
+                eprintln!("Error: {e:?}");
             }
         });
     }
@@ -50,7 +47,7 @@ fn main() -> eyre::Result<()> {
 fn spawn_handoff_communicator(server: Arc<TcpeServer>, handoff_port: u16) -> eyre::Result<()> {
     Server::new(move |request| {
         handle_handoff(request, &server).unwrap_or_else(|e| {
-            println!("Error: {e:?}");
+            eprintln!("Error: {e:?}");
             Response::builder()
                 .header(CONTENT_TYPE, "application/json")
                 .body(json!({"error": format!("{e}")}).to_string().into())
@@ -70,25 +67,13 @@ fn handle_handoff(
     server: &TcpeServer,
 ) -> eyre::Result<Response<Body>> {
     if request.uri().path() == "/handoff-start" && request.method() == Method::POST {
-        println!("received handoff start");
         let handoff: TcpeHandoffStart =
             serde_json::from_reader(request.body_mut()).context("Invalid body")?;
-        println!(
-            "connection {}, data {:?}",
-            handoff.connection_id,
-            String::from_utf8_lossy(&handoff.current_data)
-        );
         server.handoff_start(handoff)?;
         empty_response()
     } else if request.uri().path() == "/handoff-end" && request.method() == Method::POST {
-        println!("received handoff end");
         let handoff: TcpeHandoffEnd =
             serde_json::from_reader(request.body_mut()).context("Invalid body")?;
-        println!(
-            "connection {}, data {:?}",
-            handoff.connection_id,
-            String::from_utf8_lossy(&handoff.left_over_data)
-        );
         server.handoff_end(handoff)?;
         empty_response()
     } else {
@@ -106,10 +91,7 @@ fn empty_response() -> Result<Response<Body>, Report> {
 }
 
 fn handle(stream: TcpeHandle) -> eyre::Result<()> {
-    let mut decoder = RequestDecoder::<BodyDecoder<RemainingBytesDecoder>>::default();
-    let mut stream = BufReader::new(stream);
-    let req = decoder.decode_exact(&mut stream)?;
-    println!("request {:?}", req);
+    let stream = BufReader::new(stream);
     let request = httpcodec::Response::new(
         HttpVersion::V1_1,
         httpcodec::StatusCode::new(200)?,
@@ -124,8 +106,6 @@ fn handle(stream: TcpeHandle) -> eyre::Result<()> {
     encoder.encode_all(&mut stream)?;
     stream.flush()?;
 
-    sleep(Duration::from_millis(100));
-    println!("Closing connection");
     stream.shutdown(Shutdown::Both)?;
     Ok(())
 }
